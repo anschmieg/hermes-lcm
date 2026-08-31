@@ -1422,6 +1422,7 @@ def test_post_llm_hook_resolves_registered_active_clone_without_host_context_com
 
     clone_ingests = []
     singleton_ingests = []
+    clone_turn_completions = []
 
     def spy_clone_ingest(messages):
         clone_ingests.append(list(messages))
@@ -1431,6 +1432,11 @@ def test_post_llm_hook_resolves_registered_active_clone_without_host_context_com
 
     monkeypatch.setattr(active_clone, "ingest", spy_clone_ingest)
     monkeypatch.setattr(ctx.engine, "ingest", spy_singleton_ingest)
+    monkeypatch.setattr(
+        active_clone,
+        "on_turn_complete",
+        lambda messages, **kwargs: clone_turn_completions.append(list(messages)),
+    )
 
     hook(
         session_id="discord-session",
@@ -1441,6 +1447,7 @@ def test_post_llm_hook_resolves_registered_active_clone_without_host_context_com
 
     assert clone_ingests == [history]
     assert singleton_ingests == []
+    assert clone_turn_completions == []
     assert active_clone.current_session_id == "discord-session"
     assert active_clone.current_conversation_id == "agent:main:discord:thread:t:t"
     assert ctx.engine.current_session_id == ""

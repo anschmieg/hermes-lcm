@@ -396,6 +396,10 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                  hermes_home: str = ""):
         self._config = config or LCMConfig.from_env()
         self._hermes_home = hermes_home
+        # The callback and session lifecycle can run on different host threads.
+        # Async snapshots take this lock while copying runtime identity/config;
+        # session rebinds and route updates take it while publishing new state.
+        self._async_state_lock = threading.RLock()
         self._async_compaction: AsyncCompactionManager | None = None
         self._async_compaction_publish_failure_hook = ""
         self._assertion_extraction_metrics_lock = threading.RLock()
@@ -1652,22 +1656,30 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             self._async_compaction = manager
         return manager
 
-    def on_turn_complete(self, messages: List[Dict[str, Any]]) -> bool:
+    def on_turn_complete(
+        self,
+        messages: List[Dict[str, Any]],
+        usage: Dict[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> bool:
         """Snapshot and enqueue background work without doing summary work.
+
+        ``usage`` and host metadata are accepted to match the ContextEngine
+        callback contract; preparation only needs the finalized transcript.
 
         The normal post-turn hook has already called :meth:`ingest`, so this
         seam only copies the host-owned history and performs a non-blocking
         bounded enqueue. Hosts that call it directly must still use ``ingest``
         when they need durable raw-message persistence.
         """
-        try:
-            manager = self._async_compaction_manager()
-        except Exception:
-            logger.warning("LCM async compaction setup failed after turn", exc_info=True)
-            return False
-        if manager is None or not messages or self._session_ignored or self._session_stateless:
-            return False
-        return manager.enqueue(messages)
+        # Do not materialize the manager here.  Normal enabled engines create it
+        # during storage binding; a runtime config toggle must not turn this
+        # bounded callback into a schema/recovery operation.
+        with self._async_state_lock:
+            manager = self._async_compaction
+            if manager is None or not messages or self._session_ignored or self._session_stateless:
+                return False
+            return manager.enqueue()
 
     def prepare_background_compaction_once(
         self,
@@ -1748,11 +1760,14 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self,
         current_chunk: List[Dict[str, Any]],
         current_source_tokens: int,
+        *,
+        config: Any | None = None,
     ) -> List[Dict[str, Any]]:
         if len(current_chunk) <= 1:
             return []
 
-        floor_tokens = max(1, self._config.leaf_chunk_tokens)
+        active_config = config or self._config
+        floor_tokens = max(1, active_config.leaf_chunk_tokens)
         shrink_targets = [
             max(floor_tokens, int(current_source_tokens * 0.75)),
             max(floor_tokens, int(current_source_tokens * 0.50)),
@@ -1772,7 +1787,22 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         initial_chunk: List[Dict[str, Any]],
         focus_topic: Optional[str] = None,
         deadline: Optional[float] = None,
+        *,
+        _config_override: Any | None = None,
+        _session_id_override: str | None = None,
+        _hermes_home_override: str | None = None,
+        _circuit_breaker_override: Any | None = None,
+        _spend_guard_override: Any | None = None,
     ) -> tuple[List[Dict[str, Any]], int, str, int, int]:
+        active_config = _config_override or self._config
+        active_session_id = (
+            self._session_id if _session_id_override is None else _session_id_override
+        )
+        active_hermes_home = (
+            self._hermes_home if _hermes_home_override is None else _hermes_home_override
+        )
+        active_circuit_breaker = _circuit_breaker_override or self._summary_circuit_breaker
+        active_spend_guard = _spend_guard_override or self._summary_spend_guard
         attempt_chunk = list(initial_chunk)
         max_attempts = 3
         attempt_number = 0
@@ -1780,12 +1810,17 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         while attempt_chunk and attempt_number < max_attempts:
             attempt_number += 1
             source_tokens = count_messages_tokens(attempt_chunk)
-            serialized = self._serialize_messages(attempt_chunk)
+            serialized = self._serialize_messages(
+                attempt_chunk,
+                config=active_config,
+                session_id=active_session_id,
+                hermes_home=active_hermes_home,
+            )
             token_budget = max(2000, int(source_tokens * 0.20))
             token_budget = min(token_budget, 12000)
 
             try:
-                timeout_seconds = self._config.summary_timeout_ms / 1000
+                timeout_seconds = active_config.summary_timeout_ms / 1000
                 if deadline is not None:
                     remaining_seconds = deadline - time.monotonic()
                     if remaining_seconds <= 0:
@@ -1796,21 +1831,25 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                     source_tokens=source_tokens,
                     token_budget=token_budget,
                     depth=0,
-                    model=self._config.summary_model,
-                    fallback_models=self._config.summary_fallback_models,
-                    circuit_breaker=self._summary_circuit_breaker,
-                    spend_guard=self._summary_spend_guard,
+                    model=active_config.summary_model,
+                    fallback_models=active_config.summary_fallback_models,
+                    circuit_breaker=active_circuit_breaker,
+                    spend_guard=active_spend_guard,
                     timeout=timeout_seconds,
-                    l2_budget_ratio=self._config.l2_budget_ratio,
-                    l3_truncate_tokens=self._config.l3_truncate_tokens,
+                    l2_budget_ratio=active_config.l2_budget_ratio,
+                    l3_truncate_tokens=active_config.l3_truncate_tokens,
                     focus_topic=focus_topic or "",
-                    custom_instructions=self._config.custom_instructions,
+                    custom_instructions=active_config.custom_instructions,
                 )
                 return attempt_chunk, source_tokens, summary_text, level, attempt_number
             except Exception as exc:
                 if attempt_number >= max_attempts or not self._is_retry_worthy_leaf_summary_error(exc):
                     raise
-                smaller_chunk = self._next_leaf_rescue_chunk(attempt_chunk, source_tokens)
+                smaller_chunk = self._next_leaf_rescue_chunk(
+                    attempt_chunk,
+                    source_tokens,
+                    config=active_config,
+                )
                 if not smaller_chunk or len(smaller_chunk) >= len(attempt_chunk):
                     raise
                 logger.warning(
@@ -2685,6 +2724,10 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self._log_session_filter_diagnostics()
 
     def on_session_start(self, session_id: str, **kwargs) -> None:
+        with self._async_state_lock:
+            self._on_session_start_unlocked(session_id, **kwargs)
+
+    def _on_session_start_unlocked(self, session_id: str, **kwargs) -> None:
         if "hermes_home" in kwargs:
             self._rebind_storage_for_home(str(kwargs.get("hermes_home") or ""))
 
@@ -4135,20 +4178,21 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                      base_url: str = "", api_key: str = "",
                      provider: str = "",
                      api_mode: str = "") -> None:
-        parent_session_id = self._in_process_parent_session_id({})
-        if parent_session_id:
-            logger.debug(
-                "LCM model update ignored for auxiliary child of %s",
-                parent_session_id,
-            )
-            return
-        self.model = str(model or "")
-        self.base_url = str(base_url or "")
-        self.api_key = str(api_key or "")
-        self.provider = str(provider or "")
-        self.api_mode = str(api_mode or "")
-        self._set_context_length(context_length, source="update_model")
-        self._update_model_pending_session_start = True
+        with self._async_state_lock:
+            parent_session_id = self._in_process_parent_session_id({})
+            if parent_session_id:
+                logger.debug(
+                    "LCM model update ignored for auxiliary child of %s",
+                    parent_session_id,
+                )
+                return
+            self.model = str(model or "")
+            self.base_url = str(base_url or "")
+            self.api_key = str(api_key or "")
+            self.provider = str(provider or "")
+            self.api_mode = str(api_mode or "")
+            self._set_context_length(context_length, source="update_model")
+            self._update_model_pending_session_start = True
 
     def _refresh_session_filters(self) -> None:
         self._session_match_keys = build_session_match_keys(
@@ -5242,15 +5286,25 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 store_id, placeholder, before_commit=_archive_in_rewrite_txn
             )
 
-    def _serialize_messages(self, messages: List[Dict[str, Any]]) -> str:
+    def _serialize_messages(
+        self,
+        messages: List[Dict[str, Any]],
+        *,
+        config: Any | None = None,
+        session_id: str | None = None,
+        hermes_home: str | None = None,
+    ) -> str:
         """Serialize messages into labeled text for the summarizer."""
+        active_config = config or self._config
+        active_session_id = self._session_id if session_id is None else session_id
+        active_hermes_home = self._hermes_home if hermes_home is None else hermes_home
         parts = []
         matched_tool_ids = _matched_tool_call_ids(messages)
         for msg in messages:
             role = msg.get("role", "unknown")
             content = redact_sensitive_value(
                 msg.get("content") or "",
-                self._config,
+                active_config,
                 parse_json_strings=False,
             )
             if role == "tool":
@@ -5258,9 +5312,9 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 externalized = maybe_externalize_tool_output(
                     content,
                     tool_call_id=tool_id,
-                    session_id=self._session_id,
-                    config=self._config,
-                    hermes_home=self._hermes_home,
+                    session_id=active_session_id,
+                    config=active_config,
+                    hermes_home=active_hermes_home,
                 )
                 if externalized:
                     content = externalized["placeholder"]
@@ -5294,7 +5348,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                             args = fn.get("arguments", "")
                             args = redact_sensitive_value(
                                 args,
-                                self._config,
+                                active_config,
                                 parse_json_strings=True,
                             )
                             args = sanitize_pre_compaction_tool_arguments(args)

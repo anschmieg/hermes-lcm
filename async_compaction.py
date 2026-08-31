@@ -21,7 +21,16 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List
 
-from .db_bootstrap import configure_connection, ensure_async_compaction_tables
+from .db_bootstrap import (
+    configure_connection,
+    ensure_async_compaction_tables,
+    ensure_temporal_rollup_invalidation_triggers,
+)
+from .fresh_tail import resolve_fresh_tail_boundary
+from .message_content import stored_text_content_for_pattern_matching
+from .message_patterns import compile_message_patterns, matches_message_pattern
+from .escalation import SummaryCircuitBreaker, SummarySpendGuard
+from .dag import SummaryNode
 from .tokens import count_message_tokens, count_messages_tokens, count_tokens
 
 logger = logging.getLogger(__name__)
@@ -51,6 +60,8 @@ class CompactionBatch:
     next_retry_at: float | None = None
     last_error: str = ""
     rejected_reason: str = ""
+    lease_owner: str = ""
+    lease_expires_at: float | None = None
 
 
 @dataclass(frozen=True)
@@ -67,6 +78,17 @@ class _BackgroundSnapshot:
     messages: List[Dict[str, Any]]
     session_id: str
     conversation_id: str
+    upper_store_id: int = 0
+    config: Any = None
+    model: str = ""
+    provider: str = ""
+    base_url: str = ""
+    api_mode: str = ""
+    hermes_home: str = ""
+    session_ignored: bool = False
+    session_stateless: bool = False
+    threshold_tokens: int = 0
+    raw_context_length: int = 0
 
 
 class _BoundedBackgroundWorker:
@@ -110,14 +132,21 @@ class _BoundedBackgroundWorker:
     def _run(self) -> None:
         while True:
             with self._condition:
+                while self._queue.empty() and not self._stopping:
+                    self._condition.wait(0.1)
                 if self._stopping and self._queue.empty():
                     return
-            try:
-                snapshot = self._queue.get(timeout=0.1)
-            except queue.Empty:
-                continue
-            with self._condition:
+                # Reserve the next queue item before releasing the condition.
+                # A drain racing the actual dequeue now observes the worker as
+                # busy instead of mistaking the empty queue for idle.
                 self._active = True
+            try:
+                snapshot = self._queue.get_nowait()
+            except queue.Empty:
+                with self._condition:
+                    self._active = False
+                    self._condition.notify_all()
+                continue
             try:
                 self._callback(snapshot)
             except Exception:
@@ -158,6 +187,8 @@ class AsyncCompactionManager:
     def __init__(self, engine: Any):
         self._engine = engine
         self._lock = threading.RLock()
+        self._owner_id = uuid.uuid4().hex
+        self._db_path = str(engine._store.db_path)
         self._conn: sqlite3.Connection | None = sqlite3.connect(
             str(engine._store.db_path),
             timeout=30.0,
@@ -167,6 +198,8 @@ class AsyncCompactionManager:
         configure_connection(self._conn)
         self._conn.row_factory = sqlite3.Row
         ensure_async_compaction_tables(self._conn)
+        if bool(getattr(engine._config, "temporal_rollups_enabled", False)):
+            ensure_temporal_rollup_invalidation_triggers(self._conn)
         self._recover_incomplete_batches()
         self._worker: _BoundedBackgroundWorker | None = None
         self._enqueued_jobs = 0
@@ -180,26 +213,43 @@ class AsyncCompactionManager:
     def _recover_incomplete_batches(self) -> None:
         conn = self._conn
         assert conn is not None
-        conn.execute(
-            """
-            UPDATE compaction_batches
-            SET state = 'rejected',
-                rejected_reason = 'restart_recovery',
-                last_error = 'incomplete async batch recovered after restart',
-                updated_at = ?
-            WHERE state IN ('pending', 'preparing', 'promoting')
-            """,
-            (time.time(),),
-        )
-        conn.execute(
-            """
-            DELETE FROM pending_summary_nodes
-            WHERE batch_id IN (
+        now = time.time()
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            stale_rows = conn.execute(
+                """
                 SELECT batch_id FROM compaction_batches
-                WHERE state = 'rejected' AND rejected_reason = 'restart_recovery'
-            )
-            """
-        )
+                WHERE state IN ('preparing', 'promoting')
+                  AND (
+                      lease_owner IS NULL
+                      OR lease_expires_at IS NULL
+                      OR lease_expires_at <= ?
+                  )
+                """,
+                (now,),
+            ).fetchall()
+            stale_ids = [str(row[0]) for row in stale_rows]
+            if stale_ids:
+                placeholders = ",".join("?" for _ in stale_ids)
+                conn.execute(
+                    f"""
+                    UPDATE compaction_batches
+                    SET state = 'pending', prepared_leaf_count = 0,
+                        lease_owner = NULL, lease_expires_at = NULL,
+                        last_error = 'stale async preparation lease reclaimed',
+                        updated_at = ?
+                    WHERE batch_id IN ({placeholders})
+                    """,
+                    [now, *stale_ids],
+                )
+                conn.execute(
+                    f"DELETE FROM pending_summary_nodes WHERE batch_id IN ({placeholders})",
+                    stale_ids,
+                )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
 
     @staticmethod
     def _hash_json(value: Any) -> str:
@@ -211,16 +261,21 @@ class AsyncCompactionManager:
         ).encode("utf-8")
         return hashlib.sha256(payload).hexdigest()
 
-    def _policy_fingerprint(self) -> str:
-        config = self._engine._config
+    def _policy_fingerprint(self, snapshot: _BackgroundSnapshot | None = None) -> str:
+        config = snapshot.config if snapshot is not None and snapshot.config is not None else self._engine._config
+        runtime_threshold_tokens = getattr(self._engine, "threshold_tokens", 0)
+        raw_context_length = getattr(self._engine, "raw_context_length", 0)
+        if snapshot is not None:
+            runtime_threshold_tokens = getattr(snapshot, "threshold_tokens", runtime_threshold_tokens)
+            raw_context_length = getattr(snapshot, "raw_context_length", raw_context_length)
         policy = {
             "protocol": _PROTOCOL_VERSION,
             "fresh_tail_count": int(getattr(config, "fresh_tail_count", 0) or 0),
             "fresh_tail_max_tokens": int(getattr(config, "fresh_tail_max_tokens", 0) or 0),
             "leaf_chunk_tokens": int(getattr(config, "leaf_chunk_tokens", 0) or 0),
             "context_threshold": float(getattr(config, "context_threshold", 0.0) or 0.0),
-            "runtime_threshold_tokens": int(getattr(self._engine, "threshold_tokens", 0) or 0),
-            "raw_context_length": int(getattr(self._engine, "raw_context_length", 0) or 0),
+            "runtime_threshold_tokens": int(runtime_threshold_tokens or 0),
+            "raw_context_length": int(raw_context_length or 0),
             "dynamic_leaf_chunk_enabled": bool(getattr(config, "dynamic_leaf_chunk_enabled", False)),
             "dynamic_leaf_chunk_max": int(getattr(config, "dynamic_leaf_chunk_max", 0) or 0),
             "ignore_message_patterns": list(getattr(config, "ignore_message_patterns", []) or []),
@@ -241,21 +296,99 @@ class AsyncCompactionManager:
             "custom_instructions": str(getattr(config, "custom_instructions", "") or ""),
             "l2_budget_ratio": float(getattr(config, "l2_budget_ratio", 0.0) or 0.0),
             "l3_truncate_tokens": int(getattr(config, "l3_truncate_tokens", 0) or 0),
+            "ignore_session_patterns": list(getattr(config, "ignore_session_patterns", []) or []),
+            "ignore_session_patterns_source": str(
+                getattr(config, "ignore_session_patterns_source", "default") or "default"
+            ),
+            "stateless_session_patterns": list(getattr(config, "stateless_session_patterns", []) or []),
+            "stateless_session_patterns_source": str(
+                getattr(config, "stateless_session_patterns_source", "default") or "default"
+            ),
+            "temporal_rollups_enabled": bool(
+                getattr(config, "temporal_rollups_enabled", False)
+            ),
+            "large_output_transcript_gc_enabled": bool(
+                getattr(config, "large_output_transcript_gc_enabled", False)
+            ),
+            "embeddings_enabled": bool(getattr(config, "embeddings_enabled", False)),
         }
         return self._hash_json(policy)
 
-    def _summary_route_fingerprint(self) -> str:
-        config = self._engine._config
+    def _summary_route_fingerprint(self, snapshot: _BackgroundSnapshot | None = None) -> str:
+        config = snapshot.config if snapshot is not None and snapshot.config is not None else self._engine._config
         route = {
             "protocol": _PROTOCOL_VERSION,
             "summary_model": str(getattr(config, "summary_model", "") or ""),
             "summary_fallback_models": list(getattr(config, "summary_fallback_models", []) or []),
-            "provider": str(getattr(self._engine, "provider", "") or ""),
-            "model": str(getattr(self._engine, "model", "") or ""),
+            "provider": str(
+                getattr(snapshot, "provider", "") if snapshot is not None else getattr(self._engine, "provider", "")
+            ) or "",
+            "model": str(
+                getattr(snapshot, "model", "") if snapshot is not None else getattr(self._engine, "model", "")
+            ) or "",
+            "base_url": str(
+                getattr(snapshot, "base_url", "") if snapshot is not None else getattr(self._engine, "base_url", "")
+            ) or "",
+            "api_mode": str(
+                getattr(snapshot, "api_mode", "") if snapshot is not None else getattr(self._engine, "api_mode", "")
+            ) or "",
             "summary_timeout_ms": int(getattr(config, "summary_timeout_ms", 0) or 0),
             "plugin_version": "hermes-lcm",
         }
         return self._hash_json(route)
+
+    def _lease_seconds(self, config: Any) -> float:
+        configured = float(
+            getattr(config, "async_background_compaction_lease_seconds", 0.0) or 0.0
+        )
+        summary_window = float(getattr(config, "summary_timeout_ms", 60_000) or 60_000) / 1000.0 + 30.0
+        return max(1.0, configured, summary_window)
+
+    def capture_snapshot(self) -> _BackgroundSnapshot:
+        """Capture small immutable runtime state and a durable message upper bound."""
+        state_lock = getattr(self._engine, "_async_state_lock", None)
+        lock = state_lock if state_lock is not None else threading.Lock()
+        with lock:
+            config = copy.deepcopy(self._engine._config)
+            session_id = str(getattr(self._engine, "_session_id", "") or "")
+            conversation_id = str(getattr(self._engine, "_conversation_id", "") or "")
+            model = str(getattr(self._engine, "model", "") or "")
+            provider = str(getattr(self._engine, "provider", "") or "")
+            base_url = str(getattr(self._engine, "base_url", "") or "")
+            api_mode = str(getattr(self._engine, "api_mode", "") or "")
+            hermes_home = str(getattr(self._engine, "_hermes_home", "") or "")
+            session_ignored = bool(getattr(self._engine, "_session_ignored", False))
+            session_stateless = bool(getattr(self._engine, "_session_stateless", False))
+            threshold_tokens = int(getattr(self._engine, "threshold_tokens", 0) or 0)
+            raw_context_length = int(getattr(self._engine, "raw_context_length", 0) or 0)
+            with self._lock:
+                conn = self._conn
+                assert conn is not None
+                upper_row = conn.execute(
+                    """
+                    SELECT COALESCE(MAX(store_id), 0)
+                    FROM messages
+                    WHERE session_id = ? AND conversation_id = ?
+                    """,
+                    (session_id, conversation_id),
+                ).fetchone()
+            upper_store_id = int(upper_row[0] or 0) if upper_row else 0
+        return _BackgroundSnapshot(
+            messages=[],
+            session_id=session_id,
+            conversation_id=conversation_id,
+            upper_store_id=upper_store_id,
+            config=config,
+            model=model,
+            provider=provider,
+            base_url=base_url,
+            api_mode=api_mode,
+            hermes_home=hermes_home,
+            session_ignored=session_ignored,
+            session_stateless=session_stateless,
+            threshold_tokens=threshold_tokens,
+            raw_context_length=raw_context_length,
+        )
 
     @classmethod
     def _source_identity_hash(cls, row: sqlite3.Row | Dict[str, Any]) -> str:
@@ -317,6 +450,8 @@ class AsyncCompactionManager:
             next_retry_at=row["next_retry_at"],
             last_error=str(row["last_error"] or ""),
             rejected_reason=str(row["rejected_reason"] or ""),
+            lease_owner=str(row["lease_owner"] or ""),
+            lease_expires_at=row["lease_expires_at"],
         )
 
     def _get_batch(self, batch_id: str) -> CompactionBatch | None:
@@ -347,60 +482,48 @@ class AsyncCompactionManager:
 
     def _candidate_rows(
         self,
-        messages: List[Dict[str, Any]],
+        snapshot: _BackgroundSnapshot,
         *,
-        session_id: str,
-        conversation_id: str,
         frontier: int,
     ) -> list[sqlite3.Row]:
-        engine = self._engine
-        if str(getattr(engine, "_session_id", "") or "") != session_id:
-            return []
-        if str(getattr(engine, "_conversation_id", "") or "") != conversation_id:
-            return []
-        raw_messages = engine._raw_backlog_messages(messages)
-        if not raw_messages:
-            return []
-        previous_map = engine._current_compress_store_ids_by_message_id
-        engine._current_compress_store_ids_by_message_id = engine._get_store_id_map_for_messages(raw_messages)
-        try:
-            source_ids = [
-                int(store_id)
-                for message in raw_messages
-                for store_id in [engine._current_compress_store_ids_by_message_id.get(id(message))]
-                if store_id is not None and int(store_id) > frontier
-            ]
-        finally:
-            engine._current_compress_store_ids_by_message_id = previous_map
-        source_ids = sorted(dict.fromkeys(source_ids))
-        if not source_ids:
-            return []
         conn = self._conn
         assert conn is not None
-        placeholders = ",".join("?" for _ in source_ids)
         rows = conn.execute(
-            f"""
+            """
             SELECT * FROM messages
-            WHERE store_id IN ({placeholders})
-              AND session_id = ? AND conversation_id = ?
+            WHERE session_id = ? AND conversation_id = ? AND store_id <= ?
             ORDER BY store_id
             """,
-            [*source_ids, session_id, conversation_id],
+            (snapshot.session_id, snapshot.conversation_id, snapshot.upper_store_id),
         ).fetchall()
-        if [int(row["store_id"]) for row in rows] != source_ids:
+        if not rows:
             return []
-        return rows
+        boundary = resolve_fresh_tail_boundary(
+            [self._message_from_row(row) for row in rows],
+            fresh_tail_count=int(getattr(snapshot.config, "fresh_tail_count", 0) or 0),
+            fresh_tail_max_tokens=int(getattr(snapshot.config, "fresh_tail_max_tokens", 0) or 0),
+        )
+        leading_anchor_count = int(
+            bool(rows and str(rows[0]["role"] or "") == "system")
+        )
+        candidates = rows[leading_anchor_count:boundary.start]
+        return [row for row in candidates if int(row["store_id"] or 0) > frontier]
 
-    def _filter_candidate_rows(self, rows: list[sqlite3.Row]) -> list[sqlite3.Row]:
-        engine = self._engine
+    def _filter_candidate_rows(
+        self,
+        rows: list[sqlite3.Row],
+        snapshot: _BackgroundSnapshot,
+    ) -> list[sqlite3.Row]:
+        compiled_patterns = compile_message_patterns(
+            getattr(snapshot.config, "ignore_message_patterns", []) or []
+        )
+        if not compiled_patterns:
+            return rows
         filtered: list[sqlite3.Row] = []
         for row in rows:
             message = dict(row)
-            try:
-                ignored = bool(engine._matches_ignore_message_patterns(message))
-            except (AttributeError, TypeError, ValueError):
-                ignored = False
-            if not ignored:
+            text = stored_text_content_for_pattern_matching(message.get("content")) or ""
+            if not matches_message_pattern(text, compiled_patterns):
                 filtered.append(row)
         return filtered
 
@@ -409,20 +532,30 @@ class AsyncCompactionManager:
         message = dict(row)
         if message.get("tool_calls") is None:
             message.pop("tool_calls", None)
+        elif isinstance(message.get("tool_calls"), str):
+            try:
+                message["tool_calls"] = json.loads(message["tool_calls"])
+            except (TypeError, ValueError, json.JSONDecodeError):
+                pass
         return message
 
-    def _chunk_rows(self, rows: list[sqlite3.Row]) -> list[list[sqlite3.Row]]:
-        engine = self._engine
-        config = engine._config
+    def _chunk_rows(
+        self,
+        rows: list[sqlite3.Row],
+        snapshot: _BackgroundSnapshot,
+    ) -> list[list[sqlite3.Row]]:
+        config = snapshot.config
         leaf_tokens = max(1, int(getattr(config, "leaf_chunk_tokens", 1) or 1))
         chunks: list[list[sqlite3.Row]] = []
         remaining = list(rows)
         while remaining:
             working_limit = leaf_tokens
             if bool(getattr(config, "dynamic_leaf_chunk_enabled", False)):
-                working_limit = engine._working_leaf_chunk_tokens(
-                    sum(int(row["token_estimate"] or 0) for row in remaining)
-                )
+                ceiling = max(leaf_tokens, int(getattr(config, "dynamic_leaf_chunk_max", leaf_tokens) or leaf_tokens))
+                working_limit = leaf_tokens
+                raw_tokens = sum(int(row["token_estimate"] or 0) for row in remaining)
+                while working_limit < ceiling and raw_tokens > working_limit * 2:
+                    working_limit = min(ceiling, working_limit * 2)
             selected: list[sqlite3.Row] = []
             used = 0
             for row in remaining:
@@ -441,8 +574,7 @@ class AsyncCompactionManager:
     def _insert_batch(
         self,
         *,
-        session_id: str,
-        conversation_id: str,
+        snapshot: _BackgroundSnapshot,
         frontier: int,
         rows: list[sqlite3.Row],
         chunks: list[list[sqlite3.Row]],
@@ -450,10 +582,12 @@ class AsyncCompactionManager:
         conn = self._conn
         assert conn is not None
         now = time.time()
+        session_id = snapshot.session_id
+        conversation_id = snapshot.conversation_id
         source_ids = [int(row["store_id"]) for row in rows]
         identity_hashes = [self._source_identity_hash(row) for row in rows]
-        policy_fingerprint = self._policy_fingerprint()
-        route_fingerprint = self._summary_route_fingerprint()
+        policy_fingerprint = self._policy_fingerprint(snapshot)
+        route_fingerprint = self._summary_route_fingerprint(snapshot)
         active_sql = ",".join("?" for _ in _ACTIVE_BATCH_STATES)
         conn.execute("BEGIN IMMEDIATE")
         try:
@@ -467,8 +601,49 @@ class AsyncCompactionManager:
                 [conversation_id, session_id, *_ACTIVE_BATCH_STATES],
             ).fetchone()
             if existing:
+                existing_batch = self._row_to_batch(existing)
+                if existing_batch.state == "ready":
+                    conn.commit()
+                    return existing_batch
+                lease_owner = existing["lease_owner"]
+                lease_expires_at = existing["lease_expires_at"]
+                can_claim = (
+                    existing_batch.state == "pending"
+                    or not lease_owner
+                    or lease_expires_at is None
+                    or float(lease_expires_at) <= now
+                    or str(lease_owner) == self._owner_id
+                )
+                if can_claim:
+                    conn.execute(
+                        f"""
+                        UPDATE compaction_batches
+                        SET state = 'preparing', lease_owner = ?,
+                            lease_expires_at = ?, updated_at = ?
+                        WHERE batch_id = ? AND state IN ({active_sql})
+                          AND (
+                              lease_owner IS NULL
+                              OR lease_expires_at IS NULL
+                              OR lease_expires_at <= ?
+                              OR lease_owner = ?
+                          )
+                        """,
+                        (
+                            self._owner_id,
+                            now + self._lease_seconds(snapshot.config),
+                            now,
+                            existing_batch.batch_id,
+                            *_ACTIVE_BATCH_STATES,
+                            now,
+                            self._owner_id,
+                        ),
+                    )
+                    existing = conn.execute(
+                        "SELECT * FROM compaction_batches WHERE batch_id = ?",
+                        (existing_batch.batch_id,),
+                    ).fetchone()
                 conn.commit()
-                return self._row_to_batch(existing)
+                return self._row_to_batch(existing) if existing else existing_batch
             failed = conn.execute(
                 """
                 SELECT * FROM compaction_batches
@@ -494,7 +669,7 @@ class AsyncCompactionManager:
                 return self._row_to_batch(failed)
             max_batches = max(
                 1,
-                int(getattr(self._engine._config, "async_background_compaction_max_batches", 2) or 2),
+                int(getattr(snapshot.config, "async_background_compaction_max_batches", 2) or 2),
             )
             active_count = conn.execute(
                 f"""
@@ -516,8 +691,8 @@ class AsyncCompactionManager:
                     policy_fingerprint, summary_route_fingerprint,
                     source_coverage_hash, source_ids, source_identity_hashes,
                     expected_leaf_count, prepared_leaf_count,
-                    created_at, updated_at
-                ) VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
+                    created_at, updated_at, lease_owner, lease_expires_at
+                ) VALUES (?, ?, ?, 'preparing', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?)
                 """,
                 (
                     batch_id,
@@ -525,8 +700,8 @@ class AsyncCompactionManager:
                     session_id,
                     frontier,
                     max(source_ids),
-                    int(getattr(self._engine._config, "fresh_tail_count", 0) or 0),
-                    int(getattr(self._engine._config, "leaf_chunk_tokens", 0) or 0),
+                    int(getattr(snapshot.config, "fresh_tail_count", 0) or 0),
+                    int(getattr(snapshot.config, "leaf_chunk_tokens", 0) or 0),
                     policy_fingerprint,
                     route_fingerprint,
                     self._source_coverage_hash(source_ids, identity_hashes),
@@ -535,6 +710,8 @@ class AsyncCompactionManager:
                     len(chunks),
                     now,
                     now,
+                    self._owner_id,
+                    now + self._lease_seconds(snapshot.config),
                 ),
             )
             conn.commit()
@@ -543,7 +720,14 @@ class AsyncCompactionManager:
             conn.rollback()
             raise
 
-    def _mark_failed(self, batch_id: str, exc: Exception) -> CompactionBatch:
+    def _mark_failed(
+        self,
+        batch_id: str,
+        exc: Exception,
+        *,
+        owner_id: str | None = None,
+        config: Any | None = None,
+    ) -> CompactionBatch:
         conn = self._conn
         assert conn is not None
         row = self._get_batch(batch_id)
@@ -552,7 +736,7 @@ class AsyncCompactionManager:
             0.0,
             float(
                 getattr(
-                    self._engine._config,
+                    config if config is not None else self._engine._config,
                     "async_background_compaction_retry_backoff_seconds",
                     300.0,
                 )
@@ -560,19 +744,45 @@ class AsyncCompactionManager:
             ),
         )
         message = f"{type(exc).__name__}: {exc}"[:500]
-        conn.execute(
-            "DELETE FROM pending_summary_nodes WHERE batch_id = ?",
-            (batch_id,),
-        )
-        conn.execute(
-            """
-            UPDATE compaction_batches
-            SET state = 'failed', failure_count = ?, next_retry_at = ?,
-                last_error = ?, updated_at = ?
-            WHERE batch_id = ?
-            """,
-            (failure_count, time.time() + backoff, message, time.time(), batch_id),
-        )
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            current = conn.execute(
+                "SELECT * FROM compaction_batches WHERE batch_id = ?",
+                (batch_id,),
+            ).fetchone()
+            if current is None:
+                conn.commit()
+                raise LookupError(f"async compaction batch disappeared: {batch_id}")
+            if owner_id and str(current["lease_owner"] or "") != owner_id:
+                # A lease may have been reclaimed while this worker was still
+                # finishing its provider call. Never remove rows belonging to
+                # the replacement owner; return its current batch unchanged.
+                conn.commit()
+                return self._row_to_batch(current)
+            failure_count = int(current["failure_count"] or 0) + 1
+            conn.execute(
+                "DELETE FROM pending_summary_nodes WHERE batch_id = ?",
+                (batch_id,),
+            )
+            owner_clause = ""
+            owner_args: list[Any] = []
+            if owner_id:
+                owner_clause = " AND lease_owner = ?"
+                owner_args.append(owner_id)
+            conn.execute(
+                f"""
+                UPDATE compaction_batches
+                SET state = 'failed', failure_count = ?, next_retry_at = ?,
+                    last_error = ?, updated_at = ?, lease_owner = NULL,
+                    lease_expires_at = NULL
+                WHERE batch_id = ?{owner_clause}
+                """,
+                [failure_count, time.time() + backoff, message, time.time(), batch_id, *owner_args],
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
         result = self._get_batch(batch_id)
         assert result is not None
         return result
@@ -584,14 +794,27 @@ class AsyncCompactionManager:
         session_id: str | None = None,
         conversation_id: str | None = None,
         leave_state: str | None = None,
+        snapshot: _BackgroundSnapshot | None = None,
     ) -> CompactionBatch | None:
-        if self._closed or not bool(getattr(self._engine._config, "async_background_compaction_enabled", False)):
+        if self._closed:
             return None
-        session_id = str(session_id or getattr(self._engine, "_session_id", "") or "")
-        conversation_id = str(
-            conversation_id or getattr(self._engine, "_conversation_id", "") or ""
-        )
-        if not session_id or not conversation_id or not messages:
+        snapshot = snapshot or self.capture_snapshot()
+        if not bool(getattr(snapshot.config, "async_background_compaction_enabled", False)):
+            return None
+        session_id = str(session_id or snapshot.session_id or "")
+        conversation_id = str(conversation_id or snapshot.conversation_id or "")
+        if not session_id or not conversation_id:
+            return None
+        if not messages and not int(snapshot.upper_store_id or 0):
+            return None
+        if (
+            session_id != snapshot.session_id
+            or conversation_id != snapshot.conversation_id
+            or snapshot.session_ignored
+            or snapshot.session_stateless
+        ):
+            return None
+        if snapshot.session_id != session_id or snapshot.conversation_id != conversation_id:
             return None
         with self._lock:
             frontier = self._current_lifecycle_frontier(conversation_id, session_id)
@@ -599,45 +822,60 @@ class AsyncCompactionManager:
                 return None
             rows = self._filter_candidate_rows(
                 self._candidate_rows(
-                    messages,
-                    session_id=session_id,
-                    conversation_id=conversation_id,
+                    snapshot,
                     frontier=frontier,
-                )
+                ),
+                snapshot,
             )
             if not rows:
                 return None
             total_tokens = count_messages_tokens([dict(row) for row in rows])
-            leaf_limit = max(1, int(getattr(self._engine._config, "leaf_chunk_tokens", 1) or 1))
+            leaf_limit = max(1, int(getattr(snapshot.config, "leaf_chunk_tokens", 1) or 1))
             if total_tokens < leaf_limit:
                 return None
-            chunks = self._chunk_rows(rows)
+            chunks = self._chunk_rows(rows, snapshot)
             if not chunks:
                 return None
             batch = self._insert_batch(
-                session_id=session_id,
-                conversation_id=conversation_id,
+                snapshot=snapshot,
                 frontier=frontier,
                 rows=rows,
                 chunks=chunks,
             )
             if batch is None:
                 return batch
-            if batch.state == "pending":
-                self._conn.execute(
-                    "UPDATE compaction_batches SET state = 'preparing', updated_at = ? WHERE batch_id = ?",
-                    (time.time(), batch.batch_id),
-                )
-                self._conn.commit()
-                batch = self._get_batch(batch.batch_id)
-            if batch is None or batch.state != "preparing":
+            if (
+                batch is None
+                or batch.state != "preparing"
+                or self._lease_owner(batch.batch_id) != self._owner_id
+            ):
                 return batch
             if leave_state == "preparing":
                 return batch
 
-            pending_ids: list[str] = []
+            prepared_rows: list[dict[str, Any]] = []
+            summary_circuit_breaker = SummaryCircuitBreaker(
+                failure_threshold=int(
+                    getattr(snapshot.config, "summary_circuit_breaker_failure_threshold", 2)
+                    or 2
+                ),
+                cooldown_seconds=int(
+                    getattr(snapshot.config, "summary_circuit_breaker_cooldown_seconds", 300)
+                    or 300
+                ),
+            )
+            summary_spend_guard = SummarySpendGuard(
+                max_calls=int(getattr(snapshot.config, "summary_spend_max_calls", 24) or 24),
+                window_seconds=float(
+                    getattr(snapshot.config, "summary_spend_window_seconds", 600.0) or 600.0
+                ),
+                backoff_seconds=float(
+                    getattr(snapshot.config, "summary_spend_backoff_seconds", 1800.0) or 1800.0
+                ),
+            )
             try:
                 for chunk in chunks:
+                    self._renew_lease(batch.batch_id, snapshot.config)
                     chunk_messages = [self._message_from_row(row) for row in chunk]
                     (
                         summarized_chunk,
@@ -645,71 +883,142 @@ class AsyncCompactionManager:
                         summary_text,
                         _level,
                         _attempts,
-                    ) = self._engine._summarize_leaf_chunk_with_rescue(chunk_messages)
+                    ) = self._engine._summarize_leaf_chunk_with_rescue(
+                        chunk_messages,
+                        _config_override=snapshot.config,
+                        _session_id_override=session_id,
+                        _hermes_home_override=snapshot.hermes_home,
+                        _circuit_breaker_override=summary_circuit_breaker,
+                        _spend_guard_override=summary_spend_guard,
+                    )
                     if not summary_text or not summarized_chunk:
                         raise RuntimeError("background summary returned no content")
+                    chunk_ids = [int(row["store_id"]) for row in chunk]
                     source_ids = [int(message["store_id"]) for message in summarized_chunk]
-                    source_rows = [row for row in chunk if int(row["store_id"]) in source_ids]
+                    if source_ids != chunk_ids:
+                        raise RuntimeError(
+                            "background summary rescue changed batch coverage"
+                        )
+                    source_rows = list(chunk)
                     source_hashes = [self._source_identity_hash(row) for row in source_rows]
                     earliest = min(float(row["timestamp"]) for row in source_rows)
                     latest = max(float(row["timestamp"]) for row in source_rows)
                     pending_id = uuid.uuid4().hex
+                    prepared_rows.append(
+                        {
+                            "pending_id": pending_id,
+                            "batch_id": batch.batch_id,
+                            "conversation_id": conversation_id,
+                            "session_id": session_id,
+                            "summary": str(summary_text),
+                            "token_count": count_tokens(str(summary_text)),
+                            "source_token_count": int(source_tokens),
+                            "source_ids": json.dumps(source_ids),
+                            "source_identity_hashes": json.dumps(source_hashes),
+                            "source_range_start_store_id": min(source_ids),
+                            "source_range_end_store_id": max(source_ids),
+                            "created_at": time.time(),
+                            "earliest_at": earliest,
+                            "latest_at": latest,
+                            "expand_hint": self._engine._extract_expand_hint(str(summary_text)),
+                        }
+                    )
+                self._conn.execute("BEGIN IMMEDIATE")
+                try:
+                    lease_row = self._conn.execute(
+                        """
+                        SELECT state, lease_owner, lease_expires_at
+                        FROM compaction_batches WHERE batch_id = ?
+                        """,
+                        (batch.batch_id,),
+                    ).fetchone()
+                    if (
+                        lease_row is None
+                        or str(lease_row["state"]) != "preparing"
+                        or str(lease_row["lease_owner"] or "") != self._owner_id
+                        or (
+                            lease_row["lease_expires_at"] is not None
+                            and float(lease_row["lease_expires_at"]) <= time.time()
+                        )
+                    ):
+                        self._conn.rollback()
+                        return self._get_batch(batch.batch_id)
+                    for pending in prepared_rows:
+                        self._conn.execute(
+                            """
+                            INSERT INTO pending_summary_nodes(
+                                pending_id, batch_id, conversation_id, session_id,
+                                depth, summary, token_count, source_token_count,
+                                source_ids, source_identity_hashes,
+                                source_range_start_store_id, source_range_end_store_id,
+                                created_at, earliest_at, latest_at, expand_hint
+                            ) VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            """,
+                            tuple(pending[key] for key in (
+                                "pending_id", "batch_id", "conversation_id", "session_id",
+                                "summary", "token_count", "source_token_count", "source_ids",
+                                "source_identity_hashes", "source_range_start_store_id",
+                                "source_range_end_store_id", "created_at", "earliest_at",
+                                "latest_at", "expand_hint",
+                            )),
+                        )
                     self._conn.execute(
                         """
-                        INSERT INTO pending_summary_nodes(
-                            pending_id, batch_id, conversation_id, session_id,
-                            depth, summary, token_count, source_token_count,
-                            source_ids, source_identity_hashes,
-                            source_range_start_store_id, source_range_end_store_id,
-                            created_at, earliest_at, latest_at, expand_hint
-                        ) VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        UPDATE compaction_batches
+                        SET state = 'ready', prepared_leaf_count = ?, updated_at = ?,
+                            lease_owner = NULL, lease_expires_at = NULL
+                        WHERE batch_id = ? AND state = 'preparing' AND lease_owner = ?
                         """,
-                        (
-                            pending_id,
-                            batch.batch_id,
-                            conversation_id,
-                            session_id,
-                            str(summary_text),
-                            count_tokens(str(summary_text)),
-                            int(source_tokens),
-                            json.dumps(source_ids),
-                            json.dumps(source_hashes),
-                            min(source_ids),
-                            max(source_ids),
-                            time.time(),
-                            earliest,
-                            latest,
-                            self._engine._extract_expand_hint(str(summary_text)),
-                        ),
+                        (len(prepared_rows), time.time(), batch.batch_id, self._owner_id),
                     )
-                    pending_ids.append(pending_id)
-                self._conn.execute(
-                    """
-                    UPDATE compaction_batches
-                    SET state = 'ready', prepared_leaf_count = ?, updated_at = ?
-                    WHERE batch_id = ?
-                    """,
-                    (len(pending_ids), time.time(), batch.batch_id),
-                )
+                    self._conn.commit()
+                except Exception:
+                    self._conn.rollback()
+                    raise
                 return self._get_batch(batch.batch_id)
             except Exception as exc:
                 logger.warning("LCM async compaction preparation failed: %s", exc)
-                return self._mark_failed(batch.batch_id, exc)
+                return self._mark_failed(
+                    batch.batch_id,
+                    exc,
+                    owner_id=self._owner_id,
+                    config=snapshot.config,
+                )
 
-    def enqueue(self, messages: List[Dict[str, Any]]) -> bool:
+    def _lease_owner(self, batch_id: str) -> str:
+        conn = self._conn
+        assert conn is not None
+        row = conn.execute(
+            "SELECT lease_owner FROM compaction_batches WHERE batch_id = ?",
+            (batch_id,),
+        ).fetchone()
+        return str(row[0] or "") if row else ""
+
+    def _renew_lease(self, batch_id: str, config: Any) -> bool:
+        conn = self._conn
+        assert conn is not None
+        now = time.time()
+        cur = conn.execute(
+            """
+            UPDATE compaction_batches
+            SET lease_expires_at = ?, updated_at = ?
+            WHERE batch_id = ? AND state = 'preparing' AND lease_owner = ?
+            """,
+            (now + self._lease_seconds(config), now, batch_id, self._owner_id),
+        )
+        conn.commit()
+        return cur.rowcount == 1
+
+    def enqueue(self, messages: List[Dict[str, Any]] | None = None) -> bool:
         if self._closed:
             return False
-        config = self._engine._config
+        snapshot = self.capture_snapshot()
+        config = snapshot.config
         if not (
             bool(getattr(config, "async_background_compaction_enabled", False))
             and bool(getattr(config, "async_background_compaction_worker_enabled", False))
         ):
             return False
-        snapshot = _BackgroundSnapshot(
-            messages=copy.deepcopy(messages),
-            session_id=str(getattr(self._engine, "_session_id", "") or ""),
-            conversation_id=str(getattr(self._engine, "_conversation_id", "") or ""),
-        )
         with self._lock:
             if self._worker is None:
                 self._worker = _BoundedBackgroundWorker(
@@ -730,8 +1039,7 @@ class AsyncCompactionManager:
         try:
             self.prepare(
                 snapshot.messages,
-                session_id=snapshot.session_id,
-                conversation_id=snapshot.conversation_id,
+                snapshot=snapshot,
             )
         except Exception:
             logger.warning("LCM async compaction snapshot failed", exc_info=True)
@@ -743,16 +1051,21 @@ class AsyncCompactionManager:
     ) -> PromotionResult:
         conn = self._conn
         assert conn is not None
-        conn.execute(
-            """
-            UPDATE compaction_batches
-            SET state = 'rejected', rejected_reason = ?, updated_at = ?
-            WHERE batch_id = ? AND state = 'ready'
-            """,
-            (reason, time.time(), batch.batch_id),
-        )
-        conn.execute("DELETE FROM pending_summary_nodes WHERE batch_id = ?", (batch.batch_id,))
-        conn.commit()
+        try:
+            conn.execute(
+                """
+                UPDATE compaction_batches
+                SET state = 'rejected', rejected_reason = ?, updated_at = ?,
+                    lease_owner = NULL, lease_expires_at = NULL
+                WHERE batch_id = ? AND state = 'ready'
+                """,
+                (reason, time.time(), batch.batch_id),
+            )
+            conn.execute("DELETE FROM pending_summary_nodes WHERE batch_id = ?", (batch.batch_id,))
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
         return PromotionResult(False, reason, batch.batch_id)
 
     def promote(
@@ -760,7 +1073,10 @@ class AsyncCompactionManager:
         batch_id: str,
         messages: List[Dict[str, Any]] | None = None,
     ) -> PromotionResult:
-        if self._closed or not bool(getattr(self._engine._config, "async_background_compaction_enabled", False)):
+        if self._closed:
+            return PromotionResult(False, "disabled", batch_id)
+        snapshot = self.capture_snapshot()
+        if not bool(getattr(snapshot.config, "async_background_compaction_enabled", False)):
             return PromotionResult(False, "disabled", batch_id)
         with self._lock:
             conn = self._conn
@@ -782,13 +1098,15 @@ class AsyncCompactionManager:
                 if batch.state != "ready":
                     conn.rollback()
                     return PromotionResult(False, batch.rejected_reason or batch.state, batch.batch_id)
-                session_id = str(getattr(self._engine, "_session_id", "") or "")
-                conversation_id = str(getattr(self._engine, "_conversation_id", "") or "")
+                session_id = snapshot.session_id
+                conversation_id = snapshot.conversation_id
                 if batch.session_id != session_id or batch.conversation_id != conversation_id:
                     return self._reject_in_transaction(batch, "session_identity_mismatch")
-                if self._policy_fingerprint() != batch.policy_fingerprint:
+                if snapshot.session_ignored or snapshot.session_stateless:
+                    return self._reject_in_transaction(batch, "session_policy_mismatch")
+                if self._policy_fingerprint(snapshot) != batch.policy_fingerprint:
                     return self._reject_in_transaction(batch, "policy_fingerprint_mismatch")
-                if self._summary_route_fingerprint() != batch.summary_route_fingerprint:
+                if self._summary_route_fingerprint(snapshot) != batch.summary_route_fingerprint:
                     return self._reject_in_transaction(batch, "summary_route_fingerprint_mismatch")
                 current_frontier = self._current_lifecycle_frontier(conversation_id, session_id)
                 if current_frontier is None or current_frontier != batch.frontier_start_store_id:
@@ -819,16 +1137,26 @@ class AsyncCompactionManager:
                 if self._source_coverage_hash(source_ids, batch.source_identity_hashes) != batch.source_coverage_hash:
                     return self._reject_in_transaction(batch, "source_coverage_mismatch")
 
-                tail_count = max(0, int(getattr(self._engine._config, "fresh_tail_count", 0) or 0))
-                tail_rows = conn.execute(
+                full_rows = conn.execute(
                     """
-                    SELECT store_id FROM messages
-                    WHERE session_id = ? AND conversation_id = ?
-                    ORDER BY store_id DESC LIMIT ?
+                    SELECT * FROM messages
+                    WHERE session_id = ? AND conversation_id = ? AND store_id <= ?
+                    ORDER BY store_id
                     """,
-                    (session_id, conversation_id, tail_count),
+                    (session_id, conversation_id, snapshot.upper_store_id),
                 ).fetchall()
-                if set(source_ids) & {int(row[0]) for row in tail_rows}:
+                tail_boundary = resolve_fresh_tail_boundary(
+                    [self._message_from_row(row) for row in full_rows],
+                    fresh_tail_count=int(getattr(snapshot.config, "fresh_tail_count", 0) or 0),
+                    fresh_tail_max_tokens=int(
+                        getattr(snapshot.config, "fresh_tail_max_tokens", 0) or 0
+                    ),
+                )
+                tail_ids = {
+                    int(row["store_id"])
+                    for row in full_rows[tail_boundary.start:]
+                }
+                if set(source_ids) & tail_ids:
                     return self._reject_in_transaction(batch, "fresh_tail_mismatch")
 
                 overlap = conn.execute(
@@ -872,6 +1200,7 @@ class AsyncCompactionManager:
                     return self._reject_in_transaction(batch, "pending_coverage_mismatch")
 
                 node_ids: list[int] = []
+                published_nodes: list[SummaryNode] = []
                 for pending in pending_rows:
                     cur = conn.execute(
                         """
@@ -895,6 +1224,22 @@ class AsyncCompactionManager:
                         ),
                     )
                     node_ids.append(int(cur.lastrowid))
+                    published_nodes.append(
+                        SummaryNode(
+                            node_id=int(cur.lastrowid),
+                            session_id=session_id,
+                            depth=int(pending["depth"]),
+                            summary=str(pending["summary"]),
+                            token_count=int(pending["token_count"]),
+                            source_token_count=int(pending["source_token_count"]),
+                            source_ids=[int(value) for value in json.loads(pending["source_ids"] or "[]")],
+                            source_type="messages",
+                            created_at=float(pending["created_at"]),
+                            earliest_at=pending["earliest_at"],
+                            latest_at=pending["latest_at"],
+                            expand_hint=pending["expand_hint"] or "",
+                        )
+                    )
                     if getattr(self._engine, "_async_compaction_publish_failure_hook", "") == "after_canonical_insert":
                         raise RuntimeError("injected async promotion failure")
 
@@ -944,11 +1289,27 @@ class AsyncCompactionManager:
                     )
                 conn.execute("DELETE FROM pending_summary_nodes WHERE batch_id = ?", (batch.batch_id,))
                 conn.commit()
-                self._engine._last_compacted_store_id = max(
-                    int(getattr(self._engine, "_last_compacted_store_id", 0) or 0),
-                    batch.frontier_end_store_id,
-                )
-                return PromotionResult(
+                source_by_id = {
+                    int(row["store_id"]): self._message_from_row(row)
+                    for row in source_rows
+                }
+                # Keep post-publish maintenance on the same engine/storage
+                # binding that produced the canonical rows. A concurrent
+                # session rebind waits on this manager lock, so it cannot make
+                # these hooks consult a different DAG or message store.
+                for node in published_nodes:
+                    try:
+                        self._engine._invalidate_rollups_for_published_node(node)
+                    except Exception:
+                        logger.warning("LCM async rollup invalidation failed after publication", exc_info=True)
+                    try:
+                        self._engine._maybe_gc_compacted_tool_results(
+                            [source_by_id[source_id] for source_id in node.source_ids if source_id in source_by_id],
+                            list(node.source_ids),
+                        )
+                    except Exception:
+                        logger.warning("LCM async transcript maintenance failed after publication", exc_info=True)
+                promotion_result = PromotionResult(
                     True,
                     "promoted",
                     batch.batch_id,
@@ -959,6 +1320,23 @@ class AsyncCompactionManager:
                 conn.rollback()
                 raise
 
+        # The durable publication transaction is complete before touching the
+        # engine's mutable runtime state. This keeps promotion's lock order
+        # compatible with on_session_start(), which takes the state lock before
+        # rebinding and closing the manager.
+        state_lock = getattr(self._engine, "_async_state_lock", None)
+        lock = state_lock if state_lock is not None else threading.Lock()
+        with lock:
+            if (
+                str(getattr(self._engine, "_session_id", "") or "") == session_id
+                and str(getattr(self._engine, "_conversation_id", "") or "") == conversation_id
+            ):
+                self._engine._last_compacted_store_id = max(
+                    int(getattr(self._engine, "_last_compacted_store_id", 0) or 0),
+                    batch.frontier_end_store_id,
+                )
+        return promotion_result
+
     def reject(self, batch_id: str, reason: str) -> PromotionResult:
         if self._closed:
             return PromotionResult(False, "closed", batch_id)
@@ -966,27 +1344,37 @@ class AsyncCompactionManager:
             conn = self._conn
             assert conn is not None
             conn.execute("BEGIN IMMEDIATE")
-            row = self._get_batch(batch_id)
-            if row is None:
+            try:
+                row = self._get_batch(batch_id)
+                if row is None:
+                    conn.rollback()
+                    return PromotionResult(False, "unknown_batch", batch_id)
+                if row.state == "ready":
+                    conn.execute(
+                        """
+                        UPDATE compaction_batches
+                        SET state='rejected', rejected_reason=?, updated_at=?,
+                            lease_owner=NULL, lease_expires_at=NULL
+                        WHERE batch_id=?
+                        """,
+                        (reason, time.time(), batch_id),
+                    )
+                    conn.execute("DELETE FROM pending_summary_nodes WHERE batch_id = ?", (batch_id,))
+                conn.commit()
+                return PromotionResult(False, reason, batch_id)
+            except Exception:
                 conn.rollback()
-                return PromotionResult(False, "unknown_batch", batch_id)
-            if row.state == "ready":
-                conn.execute(
-                    "UPDATE compaction_batches SET state='rejected', rejected_reason=?, updated_at=? WHERE batch_id=?",
-                    (reason, time.time(), batch_id),
-                )
-                conn.execute("DELETE FROM pending_summary_nodes WHERE batch_id = ?", (batch_id,))
-            conn.commit()
-            return PromotionResult(False, reason, batch_id)
+                raise
 
     def promote_next(self, messages: List[Dict[str, Any]]) -> PromotionResult | None:
-        if not bool(getattr(self._engine._config, "async_background_compaction_enabled", False)):
+        snapshot = self.capture_snapshot()
+        if not bool(getattr(snapshot.config, "async_background_compaction_enabled", False)):
             return None
         with self._lock:
             conn = self._conn
             assert conn is not None
-            session_id = str(getattr(self._engine, "_session_id", "") or "")
-            conversation_id = str(getattr(self._engine, "_conversation_id", "") or "")
+            session_id = snapshot.session_id
+            conversation_id = snapshot.conversation_id
             row = conn.execute(
                 """
                 SELECT batch_id FROM compaction_batches
@@ -1095,19 +1483,46 @@ class AsyncCompactionManager:
         self._closed = True
         worker = self._worker
         if worker is not None:
-            timeout = max(
-                5.0,
-                float(getattr(self._engine._config, "summary_timeout_ms", 60000) or 60000) / 1000.0
-                + 5.0,
-            )
-            if not worker.close(timeout):
-                logger.warning("LCM async compaction worker did not stop before shutdown timeout")
+            # A live daemon callback still owns this manager connection. Wait
+            # for it rather than closing SQLite underneath the worker. A caller
+            # that needs a bounded wait can use drain(timeout) before shutdown.
+            if not worker.close(timeout=None):
+                logger.warning("LCM async compaction worker did not stop before shutdown")
+                return
         with self._lock:
             conn = self._conn
-            self._conn = None
             if conn is not None:
+                try:
+                    owned_rows = conn.execute(
+                        """
+                        SELECT batch_id FROM compaction_batches
+                        WHERE state IN ('preparing', 'promoting') AND lease_owner = ?
+                        """,
+                        (self._owner_id,),
+                    ).fetchall()
+                    owned_ids = [str(row[0]) for row in owned_rows]
+                    conn.execute(
+                        """
+                        UPDATE compaction_batches
+                        SET state = 'pending', prepared_leaf_count = 0,
+                            lease_owner = NULL, lease_expires_at = NULL,
+                            updated_at = ?
+                        WHERE state IN ('preparing', 'promoting') AND lease_owner = ?
+                        """,
+                        (time.time(), self._owner_id),
+                    )
+                    if owned_ids:
+                        placeholders = ",".join("?" for _ in owned_ids)
+                        conn.execute(
+                            f"DELETE FROM pending_summary_nodes WHERE batch_id IN ({placeholders})",
+                            owned_ids,
+                        )
+                    conn.commit()
+                except sqlite3.Error:
+                    conn.rollback()
                 try:
                     conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
                 except sqlite3.Error:
                     pass
                 conn.close()
+                self._conn = None

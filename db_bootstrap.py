@@ -980,6 +980,22 @@ def ensure_async_compaction_tables(conn: sqlite3.Connection) -> None:
             ON pending_summary_nodes(batch_id, source_range_start_store_id);
         """
     )
+    columns = {
+        str(row[1])
+        for row in conn.execute("PRAGMA table_info(compaction_batches)").fetchall()
+    }
+    add_column_if_missing(
+        conn,
+        columns,
+        "lease_owner",
+        "ALTER TABLE compaction_batches ADD COLUMN lease_owner TEXT",
+    )
+    add_column_if_missing(
+        conn,
+        columns,
+        "lease_expires_at",
+        "ALTER TABLE compaction_batches ADD COLUMN lease_expires_at REAL",
+    )
     conn.commit()
 
 

@@ -325,6 +325,7 @@ ENV_FIELD_SPECS: tuple[_EnvFieldSpec, ...] = (
     _EnvFieldSpec("async_background_compaction_worker_enabled", "LCM_ASYNC_BACKGROUND_COMPACTION_WORKER_ENABLED", bool),
     _EnvFieldSpec("async_background_compaction_max_batches", "LCM_ASYNC_BACKGROUND_COMPACTION_MAX_BATCHES", int),
     _EnvFieldSpec("async_background_compaction_retry_backoff_seconds", "LCM_ASYNC_BACKGROUND_COMPACTION_RETRY_BACKOFF_SECONDS", float),
+    _EnvFieldSpec("async_background_compaction_lease_seconds", "LCM_ASYNC_BACKGROUND_COMPACTION_LEASE_SECONDS", float),
     _EnvFieldSpec("critical_budget_pressure_ratio", "LCM_CRITICAL_BUDGET_PRESSURE_RATIO", float),
     _EnvFieldSpec("threshold_full_sweep_enabled", "LCM_THRESHOLD_FULL_SWEEP_ENABLED", bool),
     _EnvFieldSpec("summary_prefix_target_tokens", "LCM_SUMMARY_PREFIX_TARGET_TOKENS", int),
@@ -489,6 +490,7 @@ class LCMConfig:
     async_background_compaction_worker_enabled: bool = False
     async_background_compaction_max_batches: int = 2
     async_background_compaction_retry_backoff_seconds: float = 300.0
+    async_background_compaction_lease_seconds: float = 300.0
     # Disabled at 0.0. When set, only bypass cache-friendly/deferred polite
     # gates once prompt pressure reaches this fraction of the context window.
     critical_budget_pressure_ratio: float = 0.0
