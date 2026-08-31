@@ -597,6 +597,9 @@ def register(ctx):
                     conversation_id=conversation_id,
                 )
                 active_engine.ingest(history)
+                on_turn_complete = getattr(active_engine, "on_turn_complete", None)
+                if callable(on_turn_complete):
+                    on_turn_complete(history)
             except Exception as exc:
                 logger.debug("LCM post_llm_call ingest error: %s", exc)
 

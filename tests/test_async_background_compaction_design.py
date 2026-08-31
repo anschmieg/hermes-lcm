@@ -1,24 +1,15 @@
-"""RED spike tests for opt-in async/background compaction.
-
-These tests intentionally describe the desired public/private contract before
-implementation exists. They stay xfailed on the design branch so the normal
-suite remains green, but strict xfail means each scenario becomes a real gate as
-soon as the feature starts landing.
-"""
+"""Contract tests for opt-in async/background compaction."""
 
 from __future__ import annotations
 
 import json
+import time
+from threading import Event
 
 import pytest
 
 from hermes_lcm.config import LCMConfig
 from hermes_lcm.engine import LCMEngine
-
-pytestmark = pytest.mark.xfail(
-    strict=True,
-    reason="async/background compaction with atomic publish is design-only; implementation not landed",
-)
 
 
 def _engine(tmp_path, *, session_id="async-session", conversation_id="async-conversation"):
@@ -27,11 +18,9 @@ def _engine(tmp_path, *, session_id="async-session", conversation_id="async-conv
         fresh_tail_count=2,
         leaf_chunk_tokens=20,
         context_threshold=0.10,
+        async_background_compaction_enabled=True,
+        async_background_compaction_worker_enabled=False,
     )
-    # Future config fields. They are dynamic here so these RED tests can be
-    # written before the dataclass grows the real fields.
-    config.async_background_compaction_enabled = True
-    config.async_background_compaction_worker_enabled = False
     engine = LCMEngine(config=config)
     engine.on_session_start(
         session_id,
@@ -242,8 +231,12 @@ def test_summary_failure_backoff_does_not_wedge_foreground_compaction(tmp_path, 
 def test_restart_recovers_or_discards_pending_batches_safely(tmp_path):
     """Given pending/preparing rows at shutdown, restart never treats them as canonical."""
     db_path = tmp_path / "restart.db"
-    config = LCMConfig(database_path=str(db_path), fresh_tail_count=2, leaf_chunk_tokens=20)
-    config.async_background_compaction_enabled = True
+    config = LCMConfig(
+        database_path=str(db_path),
+        fresh_tail_count=2,
+        leaf_chunk_tokens=20,
+        async_background_compaction_enabled=True,
+    )
 
     engine = LCMEngine(config=config)
     engine.on_session_start("restart-session", conversation_id="restart-conversation", context_length=1_000)
@@ -283,6 +276,33 @@ def test_successful_atomic_promotion_is_all_or_nothing(tmp_path):
         lifecycle = engine.get_status()["lifecycle"]
         assert lifecycle["current_frontier_store_id"] > old_frontier
         assert lifecycle["current_frontier_store_id"] == batch.frontier_end_store_id
+        assert engine.get_async_compaction_status()["promoted_batches"] == 1
+    finally:
+        engine.shutdown()
+
+
+def test_preflight_promotes_ready_batch_before_duplicate_leaf_summary(tmp_path, monkeypatch):
+    """Normal threshold compaction adopts a ready batch without duplicate leaf work."""
+    engine = _engine(tmp_path)
+    calls = []
+
+    def summarize(**kwargs):
+        calls.append(kwargs)
+        return "prepared summary", 0
+
+    monkeypatch.setattr("hermes_lcm.engine.summarize_with_escalation", summarize)
+    try:
+        messages = _messages()
+        engine.ingest(messages)
+        batch = engine.prepare_background_compaction_once(messages)
+        prepared_call_count = len(calls)
+
+        assert engine.should_compress_preflight(messages)
+        compacted = engine.compress(messages, current_tokens=engine.threshold_tokens + 1)
+
+        assert len([call for call in calls if call["depth"] == 0]) == prepared_call_count
+        assert compacted != messages
+        assert engine._dag.get_session_node_count(engine.current_session_id) >= batch.expected_leaf_count
         assert engine.get_async_compaction_status()["promoted_batches"] == 1
     finally:
         engine.shutdown()
@@ -330,4 +350,46 @@ def test_status_and_doctor_report_async_compaction_counts(tmp_path):
         assert async_checks
         assert any("prepared_batches" in check["detail"] for check in async_checks)
     finally:
+        engine.shutdown()
+
+
+def test_on_turn_complete_enqueues_without_waiting_for_summary(tmp_path, monkeypatch):
+    """The worker owns slow preparation; the completed-turn seam stays quick."""
+    config = LCMConfig(
+        database_path=str(tmp_path / "worker.db"),
+        fresh_tail_count=2,
+        leaf_chunk_tokens=20,
+        context_threshold=0.10,
+        async_background_compaction_enabled=True,
+        async_background_compaction_worker_enabled=True,
+    )
+    engine = LCMEngine(config=config)
+    engine.on_session_start(
+        "worker-session",
+        conversation_id="worker-conversation",
+        platform="test",
+        context_length=1_000,
+    )
+    started = Event()
+    release = Event()
+
+    def blocked_summary(**kwargs):
+        started.set()
+        assert release.wait(2.0)
+        return "background summary", 0
+
+    monkeypatch.setattr("hermes_lcm.engine.summarize_with_escalation", blocked_summary)
+    try:
+        messages = _messages()
+        engine.ingest(messages)
+        started_at = time.perf_counter()
+        assert engine.on_turn_complete(messages) is True
+        assert time.perf_counter() - started_at < 0.5
+        assert started.wait(2.0)
+        assert engine._dag.get_session_node_count(engine.current_session_id) == 0
+        release.set()
+        assert engine.drain_async_compaction(timeout=3.0)
+        assert engine.get_async_compaction_status()["prepared_batches"] == 1
+    finally:
+        release.set()
         engine.shutdown()

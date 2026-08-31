@@ -381,6 +381,7 @@ class CompactionMixin:
             self._last_compression_noop_reason = "empty message list"
             return messages
 
+        preflight_requested = self._last_compression_status == "pending"
         self._last_compression_status = "running"
         self._last_compression_noop_reason = ""
         _compress_started = time.perf_counter()
@@ -518,6 +519,46 @@ class CompactionMixin:
             max_leaf_passes = _THRESHOLD_FULL_SWEEP_MAX_PASSES
         if deferred_maintenance_active:
             max_leaf_passes = max(1, self._config.deferred_maintenance_max_passes)
+
+        # Promotion is attempted only after the normal host preflight has
+        # requested compression. Direct calls to ``compress`` remain the
+        # synchronous compatibility path, which also gives a foreground call
+        # deterministic precedence over manually prepared test/operator work.
+        if preflight_requested and not force_overflow:
+            try:
+                async_manager = getattr(self, "_async_compaction_manager", lambda: None)()
+            except Exception:
+                # Async preparation is an optimization. A sidecar/opening or
+                # worker failure must leave the existing synchronous path
+                # available for the same turn.
+                logger.warning(
+                    "LCM async compaction setup failed; using foreground compaction",
+                    exc_info=True,
+                )
+                async_manager = None
+            if async_manager is not None:
+                async_source_map = self._get_store_id_map_for_messages(working_messages)
+                try:
+                    async_result = async_manager.promote_next(messages)
+                except Exception:
+                    logger.warning(
+                        "LCM async promotion failed; using foreground compaction",
+                        exc_info=True,
+                    )
+                    async_result = None
+                if async_result is not None and async_result.promoted:
+                    async_batch = async_manager.get_batch(async_result.batch_id)
+                    if async_batch is not None:
+                        async_source_ids = set(async_batch.source_ids)
+                        working_messages = [
+                            message for message in working_messages
+                            if async_source_map.get(id(message)) not in async_source_ids
+                        ]
+                        anchor_source_messages = list(working_messages)
+                        pressure_messages = list(working_messages)
+                        leaf_compacted_this_turn = True
+                        leaf_passes = async_batch.expected_leaf_count
+                        max_leaf_passes = 0
 
         explicit_focus_topic = focus_topic is not None
 

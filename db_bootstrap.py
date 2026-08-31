@@ -759,6 +759,8 @@ def ensure_temporal_rollup_tables(conn: sqlite3.Connection) -> None:
             ON lcm_rollup_invalidations(scope, covered_start, covered_end, event_id);
         """
     )
+
+
     # Backfill the generation/lease columns for a table created by an earlier
     # lazy revision that predates optimistic concurrency.
     rollup_columns = {
@@ -905,6 +907,80 @@ def ensure_temporal_rollup_tables(conn: sqlite3.Connection) -> None:
         """
     )
     ensure_temporal_rollup_invalidation_triggers(conn)
+
+
+def ensure_async_compaction_tables(conn: sqlite3.Connection) -> None:
+    """Create the opt-in async-compaction sidecar tables.
+
+    The sidecar is deliberately outside the numeric schema ladder. A disabled
+    install therefore keeps the core database shape unchanged, while an
+    enabled install can safely create these tables on demand. Pending rows are
+    never joined by canonical readers: only promotion copies them into the
+    normal ``summary_nodes`` table.
+    """
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS compaction_batches (
+            batch_id TEXT PRIMARY KEY,
+            conversation_id TEXT NOT NULL,
+            session_id TEXT NOT NULL,
+            state TEXT NOT NULL CHECK (state IN (
+                'pending', 'preparing', 'ready', 'promoted', 'rejected',
+                'promoting', 'failed', 'superseded'
+            )),
+            frontier_start_store_id INTEGER NOT NULL,
+            frontier_end_store_id INTEGER NOT NULL,
+            fresh_tail_count INTEGER NOT NULL,
+            leaf_chunk_tokens INTEGER NOT NULL,
+            policy_fingerprint TEXT NOT NULL,
+            summary_route_fingerprint TEXT NOT NULL,
+            source_coverage_hash TEXT NOT NULL,
+            source_ids TEXT NOT NULL,
+            source_identity_hashes TEXT NOT NULL,
+            expected_leaf_count INTEGER NOT NULL,
+            prepared_leaf_count INTEGER NOT NULL DEFAULT 0,
+            failure_count INTEGER NOT NULL DEFAULT 0,
+            next_retry_at REAL,
+            last_error TEXT,
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL,
+            promoted_at REAL,
+            rejected_reason TEXT
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_compaction_batches_conversation_state
+            ON compaction_batches(conversation_id, state, created_at);
+        CREATE INDEX IF NOT EXISTS idx_compaction_batches_session_state
+            ON compaction_batches(session_id, state, created_at);
+        CREATE INDEX IF NOT EXISTS idx_compaction_batches_retry_state
+            ON compaction_batches(next_retry_at, state);
+
+        CREATE TABLE IF NOT EXISTS pending_summary_nodes (
+            pending_id TEXT PRIMARY KEY,
+            batch_id TEXT NOT NULL REFERENCES compaction_batches(batch_id),
+            conversation_id TEXT NOT NULL,
+            session_id TEXT NOT NULL,
+            depth INTEGER NOT NULL DEFAULT 0,
+            summary TEXT NOT NULL,
+            token_count INTEGER NOT NULL,
+            source_token_count INTEGER NOT NULL,
+            source_ids TEXT NOT NULL,
+            source_identity_hashes TEXT NOT NULL,
+            source_range_start_store_id INTEGER NOT NULL,
+            source_range_end_store_id INTEGER NOT NULL,
+            previous_pending_ids TEXT NOT NULL DEFAULT '[]',
+            created_at REAL NOT NULL,
+            earliest_at REAL,
+            latest_at REAL,
+            expand_hint TEXT DEFAULT '',
+            UNIQUE(batch_id, source_range_start_store_id, source_range_end_store_id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_pending_summary_nodes_batch_range
+            ON pending_summary_nodes(batch_id, source_range_start_store_id);
+        """
+    )
+    conn.commit()
 
 
 def ensure_temporal_rollup_invalidation_triggers(conn: sqlite3.Connection) -> None:

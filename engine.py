@@ -126,6 +126,11 @@ from .aux_session import AuxiliarySessionMixin
 from .placeholder_ledger import PlaceholderLedgerMixin
 from .reconcile import ReconcileMixin, _PRESERVED_OBJECTIVE_CONTEXT_PREFIX
 from .compaction import CompactionMixin
+from .async_compaction import (
+    AsyncCompactionManager,
+    CompactionBatch,
+    PromotionResult,
+)
 from .reset_state import ResetStateMixin
 from .bypass import BypassMixin
 from .lifecycle_state import LifecycleStateStore
@@ -391,6 +396,8 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                  hermes_home: str = ""):
         self._config = config or LCMConfig.from_env()
         self._hermes_home = hermes_home
+        self._async_compaction: AsyncCompactionManager | None = None
+        self._async_compaction_publish_failure_hook = ""
         self._assertion_extraction_metrics_lock = threading.RLock()
         self._assertion_extraction_idle = threading.Event()
         self._assertion_extraction_idle.set()
@@ -692,6 +699,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
 
     def _bind_storage(self, db_path: str | Path, hermes_home: str = "") -> None:
         """Bind store/DAG/lifecycle helpers to one SQLite database."""
+        self._async_compaction = None
         self._assertions = None
         self._query_views = None
         self._adaptive_retrieval = None
@@ -708,6 +716,8 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 # this engine can publish or delete a DAG node.
                 initialize_rollup_invalidation_outbox(self._dag)
             self._lifecycle = LifecycleStateStore(db_path)
+            if bool(getattr(self._config, "async_background_compaction_enabled", False)):
+                self._async_compaction = AsyncCompactionManager(self)
             self._assertions = (
                 AssertionStore(db_path)
                 if bool(getattr(self._config, "assertions_enabled", False))
@@ -742,6 +752,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
     def _close_storage(self) -> None:
         """Best-effort close of currently bound SQLite helpers."""
         for attr in (
+            "_async_compaction",
             "_adaptive_retrieval",
             "_store",
             "_dag",
@@ -1630,6 +1641,90 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 )
             except Exception as e:
                 self._record_ingest_failure("per-turn ingest()", e)
+
+    def _async_compaction_manager(self) -> AsyncCompactionManager | None:
+        """Return the opt-in manager, materializing it only when enabled."""
+        if not bool(getattr(self._config, "async_background_compaction_enabled", False)):
+            return None
+        manager = self._async_compaction
+        if manager is None:
+            manager = AsyncCompactionManager(self)
+            self._async_compaction = manager
+        return manager
+
+    def on_turn_complete(self, messages: List[Dict[str, Any]]) -> bool:
+        """Snapshot and enqueue background work without doing summary work.
+
+        The normal post-turn hook has already called :meth:`ingest`, so this
+        seam only copies the host-owned history and performs a non-blocking
+        bounded enqueue. Hosts that call it directly must still use ``ingest``
+        when they need durable raw-message persistence.
+        """
+        try:
+            manager = self._async_compaction_manager()
+        except Exception:
+            logger.warning("LCM async compaction setup failed after turn", exc_info=True)
+            return False
+        if manager is None or not messages or self._session_ignored or self._session_stateless:
+            return False
+        return manager.enqueue(messages)
+
+    def prepare_background_compaction_once(
+        self,
+        messages: List[Dict[str, Any]],
+        *,
+        leave_state: str | None = None,
+    ) -> CompactionBatch | None:
+        """Prepare one pending batch synchronously for tests and host adapters."""
+        manager = self._async_compaction_manager()
+        if manager is None:
+            return None
+        return manager.prepare(messages, leave_state=leave_state)
+
+    def promote_prepared_compaction(
+        self,
+        batch_id: str,
+        messages: List[Dict[str, Any]] | None = None,
+    ) -> PromotionResult:
+        """Attempt one validated, atomic pending-batch publication."""
+        manager = self._async_compaction_manager()
+        if manager is None:
+            return PromotionResult(False, "disabled", batch_id)
+        return manager.promote(batch_id, messages)
+
+    def reject_prepared_compaction(self, batch_id: str, *, reason: str) -> PromotionResult:
+        manager = self._async_compaction_manager()
+        if manager is None:
+            return PromotionResult(False, "disabled", batch_id)
+        return manager.reject(batch_id, reason)
+
+    def get_async_compaction_status(self) -> Dict[str, Any]:
+        manager = self._async_compaction
+        if manager is None:
+            return {
+                "enabled": bool(getattr(self._config, "async_background_compaction_enabled", False)),
+                "worker_enabled": bool(getattr(self._config, "async_background_compaction_worker_enabled", False)),
+                "pending_batches": 0,
+                "preparing_batches": 0,
+                "prepared_batches": 0,
+                "promoted_batches": 0,
+                "rejected_batches": 0,
+                "failed_batches": 0,
+                "superseded_batches": 0,
+                "queue_depth": 0,
+                "worker_active": False,
+                "enqueued_jobs": 0,
+                "dropped_jobs": 0,
+                "pending_summaries": 0,
+                "oldest_pending_age_seconds": None,
+                "last_rejected_reason": None,
+                "last_error": None,
+            }
+        return manager.status(self.current_conversation_id or self._conversation_id)
+
+    def drain_async_compaction(self, timeout: float | None = None) -> bool:
+        manager = self._async_compaction
+        return True if manager is None else manager.drain(timeout)
 
     def _is_retry_worthy_leaf_summary_error(self, exc: Exception) -> bool:
         if isinstance(exc, TimeoutError):
@@ -3892,6 +3987,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             "config_sources": dict(getattr(self._config, "config_sources", {}) or {}),
             "config_source_warnings": list(getattr(self._config, "config_source_warnings", []) or []),
             "ignored_config_yaml_lcm_keys": list(getattr(self._config, "ignored_config_yaml_lcm_keys", []) or []),
+            "async_compaction": self.get_async_compaction_status(),
         })
         with self._assertion_extraction_metrics_lock:
             status["assertion_extraction"] = {
@@ -6640,6 +6736,9 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
 
     def shutdown(self):
         self._unregister_active_engine_binding()
+        if self._async_compaction is not None:
+            self._async_compaction.close()
+            self._async_compaction = None
         if self._adaptive_retrieval is not None:
             self._adaptive_retrieval.close()
         self._store.close()

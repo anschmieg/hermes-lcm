@@ -1,6 +1,6 @@
 # Opt-in async/background compaction with atomic publish
 
-Design spike for preparing old stable chunks off the turn-critical path while keeping current LCM behavior unchanged unless explicitly enabled.
+Production implementation for preparing old stable chunks off the turn-critical path while keeping current LCM behavior unchanged unless explicitly enabled.
 
 Refs:
 
@@ -279,7 +279,7 @@ Doctor should warn, not fail, for normal disabled state. It should warn on:
 
 ## Test matrix
 
-These are mirrored in `tests/test_async_background_compaction_design.py` as xfailed RED spike tests until the implementation exists.
+These are mirrored in `tests/test_async_background_compaction_design.py` as passing contract tests.
 
 | Test | Proves |
 | --- | --- |
@@ -296,9 +296,13 @@ These are mirrored in `tests/test_async_background_compaction_design.py` as xfai
 | `test_atomic_promotion_rolls_back_partial_publish_failure` | A mid-promotion failure leaves no canonical node/frontier/batch half-state. |
 | `test_status_and_doctor_report_async_compaction_counts` | Operators see pending/prepared/promoted/rejected/failed counts. |
 
-## Open questions
+## Operational notes
 
-- Should v1 reject a ready batch when only a prefix is still publishable, or support prefix promotion? Recommendation: reject in v1. Prefix promotion makes continuity and expected leaf counts more complex.
-- Should automatic workers live inside `LCMEngine`, a plugin lifecycle helper, or a host-managed scheduler? Recommendation: start with a manual one-shot preparer and make the automatic worker a later slice.
-- Should route fingerprint include fallback model order? Recommendation: yes. Different fallback order can change output after partial failures.
-- Should summary timeout changes reject prepared work? Recommendation: no unless timeout policy changes the output contract; include route/model/policy version, not operational timing knobs.
+- A ready batch is rejected when only a prefix remains publishable. Prefix
+  promotion would make continuity and expected leaf counts more complex.
+- Automatic preparation uses a plugin-owned bounded worker behind
+  `async_background_compaction_worker_enabled`; hosts may also use the one-shot
+  preparation seam for deterministic scheduling and tests.
+- Route fingerprints include fallback model order because it can change output
+  after partial failures. Live timeout changes also invalidate prepared output
+  in this first production slice.
