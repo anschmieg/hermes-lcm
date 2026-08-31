@@ -16,6 +16,7 @@ import threading
 import time
 from collections import deque
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
@@ -88,6 +89,21 @@ from .rollup_builder import (
 from .assertion_extraction import ModelAssertionExtractor
 from .assertion_store import AssertionStore, SourceSnapshot
 from .adaptive_retrieval import AdaptiveRetrievalRegistry
+
+
+@dataclass(frozen=True)
+class _ForegroundCompactionBinding:
+    """Immutable resources and identity owned by one foreground operation."""
+
+    generation: int
+    session_id: str
+    conversation_id: str
+    hermes_home: str
+    config: Any
+    store: Any
+    dag: Any
+    lifecycle: Any
+    manager: Any
 from .query_view_store import QueryViewStore
 from .schemas import (
     LCM_DESCRIBE,
@@ -400,6 +416,10 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         # Async snapshots take this lock while copying runtime identity/config;
         # session rebinds and route updates take it while publishing new state.
         self._async_state_lock = threading.RLock()
+        self._binding_generation = 0
+        self._foreground_operation_count = 0
+        self._retired_storage: list[tuple[Any, ...]] = []
+        self._shutdown_started = False
         self._async_compaction: AsyncCompactionManager | None = None
         self._async_compaction_publish_failure_hook = ""
         self._assertion_extraction_metrics_lock = threading.RLock()
@@ -720,6 +740,8 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 # this engine can publish or delete a DAG node.
                 initialize_rollup_invalidation_outbox(self._dag)
             self._lifecycle = LifecycleStateStore(db_path)
+            # Background preparation remains opt-in. Disabled engines create
+            # the foreground fence lazily when a canonical write begins.
             if bool(getattr(self._config, "async_background_compaction_enabled", False)):
                 self._async_compaction = AsyncCompactionManager(self)
             self._assertions = (
@@ -753,9 +775,47 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             self._close_storage()
             raise
 
-    def _close_storage(self) -> None:
-        """Best-effort close of currently bound SQLite helpers."""
-        for attr in (
+    def _close_storage(self, *, detach: bool = True) -> None:
+        """Retire current SQLite helpers, deferring close for foreground users."""
+        bundle = tuple(
+            getattr(self, attr, None)
+            for attr in (
+                "_async_compaction",
+                "_adaptive_retrieval",
+                "_store",
+                "_dag",
+                "_lifecycle",
+                "_assertions",
+                "_query_views",
+            )
+        )
+        if detach:
+            for attr in (
+                "_async_compaction",
+                "_adaptive_retrieval",
+                "_store",
+                "_dag",
+                "_lifecycle",
+                "_assertions",
+                "_query_views",
+            ):
+                setattr(self, attr, None)
+        if self._foreground_operation_count:
+            self._retired_storage.append(bundle)
+            manager = bundle[0]
+            close = getattr(manager, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:
+                    logger.debug("LCM failed retiring async manager", exc_info=True)
+            return
+        self._close_storage_bundle(bundle)
+
+    @staticmethod
+    def _close_storage_bundle(bundle: tuple[Any, ...]) -> None:
+        """Best-effort close of one detached storage generation."""
+        attrs = (
             "_async_compaction",
             "_adaptive_retrieval",
             "_store",
@@ -763,14 +823,64 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             "_lifecycle",
             "_assertions",
             "_query_views",
-        ):
-            helper = getattr(self, attr, None)
+        )
+        for attr, helper in zip(attrs, bundle):
             close = getattr(helper, "close", None)
             if callable(close):
                 try:
                     close()
                 except Exception:
                     logger.debug("LCM failed closing %s during profile rebind", attr, exc_info=True)
+
+    def _begin_foreground_compaction(self) -> _ForegroundCompactionBinding | None:
+        """Capture an immutable resource binding before any provider call."""
+        with self._async_state_lock:
+            if self._shutdown_started or self._store is None:
+                return None
+            manager = self._async_compaction_manager()
+            if manager is None or not manager.begin_foreground_operation():
+                return None
+            self._foreground_operation_count += 1
+            return _ForegroundCompactionBinding(
+                generation=self._binding_generation,
+                session_id=str(self._session_id or ""),
+                conversation_id=str(self._conversation_id or ""),
+                hermes_home=str(self._hermes_home or ""),
+                config=copy.deepcopy(self._config),
+                store=self._store,
+                dag=self._dag,
+                lifecycle=self._lifecycle,
+                manager=manager,
+            )
+
+    def _foreground_binding_is_current(self, binding: _ForegroundCompactionBinding) -> bool:
+        with self._async_state_lock:
+            return bool(
+                not self._shutdown_started
+                and self._binding_generation == binding.generation
+                and self._store is binding.store
+                and self._dag is binding.dag
+                and self._lifecycle is binding.lifecycle
+                and self._session_id == binding.session_id
+                and self._conversation_id == binding.conversation_id
+            )
+
+    def _end_foreground_compaction(self, binding: _ForegroundCompactionBinding) -> None:
+        """Release the binding and close detached generations after its last user."""
+        try:
+            binding.manager.end_foreground_operation()
+        finally:
+            with self._async_state_lock:
+                self._foreground_operation_count = max(
+                    0, self._foreground_operation_count - 1
+                )
+                if self._foreground_operation_count == 0 and self._retired_storage:
+                    retired = tuple(self._retired_storage)
+                    self._retired_storage.clear()
+                else:
+                    retired = ()
+            for bundle in retired:
+                self._close_storage_bundle(bundle)
 
     def _assertion_extraction_model(self) -> str:
         return str(
@@ -844,16 +954,18 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         """
         if not hermes_home:
             return False
+        requested_home = str(hermes_home)
         if self._config.database_path:
             current_home = str(self._hermes_home or "")
             current_store_home = str(getattr(getattr(self, "_store", None), "_hermes_home", "") or "")
-            if current_home == str(hermes_home) and current_store_home == str(hermes_home):
+            if current_home == requested_home and current_store_home == requested_home:
                 return False
-            self._hermes_home = hermes_home
-            store = getattr(self, "_store", None)
-            if store is not None:
-                store._hermes_home = hermes_home
+            self._binding_generation += 1
+            self._close_storage()
+            self._hermes_home = requested_home
+            self._bind_storage(self._resolve_db_path(requested_home), requested_home)
             self._reset_profile_runtime_state()
+            # _close_storage() already detached and deferred this generation.
             logger.info("LCM rebound Hermes home for configured database path %s", hermes_home)
             return True
 
@@ -862,6 +974,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         if current_db == db_path and str(self._hermes_home or "") == str(hermes_home):
             return False
 
+        self._binding_generation += 1
         self._close_storage()
         self._hermes_home = hermes_home
         self._bind_storage(db_path, hermes_home)
@@ -1647,11 +1760,11 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 self._record_ingest_failure("per-turn ingest()", e)
 
     def _async_compaction_manager(self) -> AsyncCompactionManager | None:
-        """Return the opt-in manager, materializing it only when enabled."""
-        if not bool(getattr(self._config, "async_background_compaction_enabled", False)):
-            return None
+        """Return the publication-fence manager; its worker stays opt-in."""
         manager = self._async_compaction
         if manager is None:
+            if self._shutdown_started or self._store is None:
+                return None
             manager = AsyncCompactionManager(self)
             self._async_compaction = manager
         return manager
@@ -2739,14 +2852,15 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             self._on_session_start_unlocked(session_id, **kwargs)
 
     def _on_session_start_unlocked(self, session_id: str, **kwargs) -> None:
+        previous_session_id = self._session_id
+        previous_conversation_id = self._conversation_id
+        requested_conversation_id = str(kwargs.get("conversation_id") or session_id)
         if "hermes_home" in kwargs:
             self._rebind_storage_for_home(str(kwargs.get("hermes_home") or ""))
 
         boundary_reason = str(kwargs.get("boundary_reason") or "")
         old_session_id = str(kwargs.get("old_session_id") or "")
-        previous_session_id = self._session_id
-        previous_conversation_id = self._conversation_id
-        requested_conversation_id = str(kwargs.get("conversation_id") or session_id)
+        self._binding_generation += 1
         self._lcm_current_start_allows_bypass_lineage = False
         requested_platform = str(kwargs.get("platform") or self._session_platform or "")
         pre_reset_preserve_ambiguous_no_frame_old_session = False
@@ -5733,7 +5847,14 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         """Check if any depth level has enough nodes for condensation."""
         self._last_condensation_suppressed_reason = ""
 
-        max_depth = self._config.incremental_max_depth
+        binding = getattr(self._thread_context, "foreground_binding", None)
+        active_config = binding.config if binding is not None else self._config
+        active_dag = binding.dag if binding is not None else self._dag
+        active_session_id = binding.session_id if binding is not None else self._session_id
+        if binding is not None and not self._foreground_binding_is_current(binding):
+            return
+
+        max_depth = active_config.incremental_max_depth
         if max_depth == 0:
             return  # condensation disabled
 
@@ -5741,19 +5862,19 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         # the deepest existing node + 1, so condensation can always
         # create the next depth level.
         if max_depth < 0:
-            all_nodes = self._dag.get_session_nodes(self._session_id)
+            all_nodes = active_dag.get_session_nodes(active_session_id)
             upper = (max(n.depth for n in all_nodes) + 1) if all_nodes else 1
         else:
             upper = max_depth
 
         condensed_any = False
         suppression_reason = ""
-        fanin = max(1, self._config.condensation_fanin)
+        fanin = max(1, active_config.condensation_fanin)
 
         for depth in range(upper):
-            uncondensed = self._dag.get_uncondensed_at_depth(
-                self._session_id, depth
-            )
+            if binding is not None and not self._foreground_binding_is_current(binding):
+                return
+            uncondensed = active_dag.get_uncondensed_at_depth(active_session_id, depth)
             if len(uncondensed) < fanin:
                 continue
 
@@ -5781,10 +5902,10 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 source_tokens, summary_tokens,
             )
 
-            if leaf_compacted_this_turn and self._config.cache_friendly_condensation_enabled:
+            if leaf_compacted_this_turn and active_config.cache_friendly_condensation_enabled:
                 break
 
-        if not condensed_any and leaf_compacted_this_turn and self._config.cache_friendly_condensation_enabled:
+        if not condensed_any and leaf_compacted_this_turn and active_config.cache_friendly_condensation_enabled:
             self._last_condensation_suppressed_reason = suppression_reason
 
     def _condense_summary_nodes(
@@ -5800,10 +5921,16 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         depth = nodes[0].depth
         if any(node.depth != depth for node in nodes):
             raise ValueError("condensation requires same-depth summary nodes")
+        binding = getattr(self._thread_context, "foreground_binding", None)
+        active_config = binding.config if binding is not None else self._config
+        active_dag = binding.dag if binding is not None else self._dag
+        active_session_id = binding.session_id if binding is not None else self._session_id
+        if binding is not None and not self._foreground_binding_is_current(binding):
+            return 0, 0, 0
         combined_text = "\n\n---\n\n".join(node.summary for node in nodes)
         source_tokens = sum(node.token_count for node in nodes)
         token_budget = max(1000, int(source_tokens * 0.40))
-        timeout_seconds = self._config.summary_timeout_ms / 1000
+        timeout_seconds = active_config.summary_timeout_ms / 1000
         if deadline is not None:
             remaining_seconds = deadline - time.monotonic()
             if remaining_seconds <= 0:
@@ -5814,22 +5941,24 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             source_tokens=source_tokens,
             token_budget=token_budget,
             depth=depth + 1,
-            model=self._config.summary_model,
-            fallback_models=self._config.summary_fallback_models,
+            model=active_config.summary_model,
+            fallback_models=active_config.summary_fallback_models,
             circuit_breaker=self._summary_circuit_breaker,
             spend_guard=self._summary_spend_guard,
             timeout=timeout_seconds,
-            l2_budget_ratio=self._config.l2_budget_ratio,
-            l3_truncate_tokens=self._config.l3_truncate_tokens,
+            l2_budget_ratio=active_config.l2_budget_ratio,
+            l3_truncate_tokens=active_config.l3_truncate_tokens,
             focus_topic=focus_topic or "",
-            custom_instructions=self._config.custom_instructions,
+            custom_instructions=active_config.custom_instructions,
         )
-        earliest_at, latest_at = self._dag.get_source_time_window(
+        if binding is not None and not self._foreground_binding_is_current(binding):
+            return 0, 0, 0
+        earliest_at, latest_at = active_dag.get_source_time_window(
             [node.node_id for node in nodes]
         )
         summary_tokens = count_tokens(summary_text)
         condensed_node = SummaryNode(
-            session_id=self._session_id,
+            session_id=active_session_id,
             depth=depth + 1,
             summary=summary_text,
             token_count=summary_tokens,
@@ -5841,8 +5970,25 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             latest_at=latest_at,
             expand_hint=self._extract_expand_hint(summary_text),
         )
-        self._dag.add_node(condensed_node)
-        self._invalidate_rollups_for_published_node(condensed_node)
+        if binding is not None and binding.conversation_id:
+            published = binding.manager.publish_foreground_node(
+                condensed_node,
+                conversation_id=binding.conversation_id,
+                session_id=binding.session_id,
+                claim_token=getattr(self._thread_context, "foreground_claim_token", None),
+                expected_generation=binding.generation,
+                config=binding.config,
+            )
+            if not published:
+                return 0, 0, 0
+        else:
+            self._dag.add_node(condensed_node)
+        self._invalidate_rollups_for_published_node(
+            condensed_node,
+            config=active_config if binding is not None else None,
+            dag=active_dag if binding is not None else None,
+            session_id=active_session_id if binding is not None else None,
+        )
         return source_tokens, summary_tokens, level
 
     def _summary_frontier_nodes(self) -> List[SummaryNode]:
@@ -6815,16 +6961,10 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
     # -- Lifecycle ---------------------------------------------------------
 
     def shutdown(self):
-        self._unregister_active_engine_binding()
-        if self._async_compaction is not None:
-            self._async_compaction.close()
-            self._async_compaction = None
-        if self._adaptive_retrieval is not None:
-            self._adaptive_retrieval.close()
-        self._store.close()
-        self._dag.close()
-        self._lifecycle.close()
-        if self._assertions is not None:
-            self._assertions.close()
-        if self._query_views is not None:
-            self._query_views.close()
+        with self._async_state_lock:
+            if self._shutdown_started:
+                return
+            self._shutdown_started = True
+            self._binding_generation += 1
+            self._unregister_active_engine_binding()
+            self._close_storage(detach=False)

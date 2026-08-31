@@ -16,6 +16,7 @@ import shutil
 import sqlite3
 import threading
 import time
+from time import monotonic as _monotonic
 from typing import Iterable, Sequence
 
 logger = logging.getLogger(__name__)
@@ -124,14 +125,14 @@ def _execute_wal_conversion_with_lock_retry(
     takes this path, so the retry only matters on first boot after an
     install/upgrade or on a rollback-journal restore.
     """
-    deadline = time.monotonic() + budget_ms / 1000.0
+    deadline = _monotonic() + budget_ms / 1000.0
     delay_seconds = 0.005
     while True:
         try:
             conn.execute("PRAGMA journal_mode=WAL")
             return
         except sqlite3.OperationalError as exc:
-            if "locked" not in str(exc).lower() or time.monotonic() >= deadline:
+            if "locked" not in str(exc).lower() or _monotonic() >= deadline:
                 raise
         time.sleep(delay_seconds)
         delay_seconds = min(delay_seconds * 2, 0.25)
@@ -909,6 +910,44 @@ def ensure_temporal_rollup_tables(conn: sqlite3.Connection) -> None:
     ensure_temporal_rollup_invalidation_triggers(conn)
 
 
+def ensure_foreground_compaction_claim_tables(conn: sqlite3.Connection) -> None:
+    """Create only the always-on foreground publication fence tables."""
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS foreground_compaction_claims (
+            conversation_id TEXT NOT NULL,
+            session_id TEXT NOT NULL,
+            owner_id TEXT NOT NULL,
+            lease_expires_at REAL NOT NULL,
+            fencing_token INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY(conversation_id, session_id)
+        );
+
+        CREATE TABLE IF NOT EXISTS foreground_compaction_fence (
+            fence_id INTEGER PRIMARY KEY CHECK (fence_id = 1),
+            next_token INTEGER NOT NULL
+        );
+        INSERT OR IGNORE INTO foreground_compaction_fence(fence_id, next_token)
+            VALUES (1, 0);
+        """
+    )
+    claim_columns = {
+        str(row[1])
+        for row in conn.execute("PRAGMA table_info(foreground_compaction_claims)").fetchall()
+    }
+    if "fencing_token" not in claim_columns:
+        conn.execute(
+            "ALTER TABLE foreground_compaction_claims "
+            "ADD COLUMN fencing_token INTEGER NOT NULL DEFAULT 0"
+        )
+    conn.execute(
+        "UPDATE foreground_compaction_fence SET next_token = MAX("
+        "next_token, COALESCE((SELECT MAX(fencing_token) "
+        "FROM foreground_compaction_claims), 0)) WHERE fence_id = 1"
+    )
+    conn.commit()
+
+
 def ensure_async_compaction_tables(conn: sqlite3.Connection) -> None:
     """Create the opt-in async-compaction sidecar tables.
 
@@ -979,13 +1018,6 @@ def ensure_async_compaction_tables(conn: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_pending_summary_nodes_batch_range
             ON pending_summary_nodes(batch_id, source_range_start_store_id);
 
-        CREATE TABLE IF NOT EXISTS foreground_compaction_claims (
-            conversation_id TEXT NOT NULL,
-            session_id TEXT NOT NULL,
-            owner_id TEXT NOT NULL,
-            lease_expires_at REAL NOT NULL,
-            PRIMARY KEY(conversation_id, session_id)
-        );
         """
     )
     columns = {
@@ -1004,6 +1036,7 @@ def ensure_async_compaction_tables(conn: sqlite3.Connection) -> None:
         "lease_expires_at",
         "ALTER TABLE compaction_batches ADD COLUMN lease_expires_at REAL",
     )
+    ensure_foreground_compaction_claim_tables(conn)
     conn.commit()
 
 

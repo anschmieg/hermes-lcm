@@ -513,6 +513,315 @@ def test_two_engines_do_not_foreground_publish_after_promotion_miss(tmp_path, mo
         engine_a.shutdown()
 
 
+def test_expired_foreground_claim_fence_discards_stale_provider_result(tmp_path, monkeypatch):
+    """A stolen foreground claim must fence the old provider result at publish."""
+    db_path = tmp_path / "foreground-fence.db"
+    config = LCMConfig(
+        database_path=str(db_path),
+        fresh_tail_count=2,
+        leaf_chunk_tokens=20,
+        context_threshold=0.10,
+        async_background_compaction_enabled=True,
+        async_background_compaction_worker_enabled=False,
+        async_background_compaction_lease_seconds=1.0,
+    )
+    engine_a = LCMEngine(config=config)
+    engine_b = LCMEngine(config=config)
+    started = Event()
+    release_first = Event()
+    calls = []
+    errors = []
+
+    def summarize(**kwargs):
+        calls.append(kwargs)
+        if len(calls) == 1:
+            started.set()
+            assert release_first.wait(3.0)
+        return "fenced foreground summary", 0
+
+    monkeypatch.setattr("hermes_lcm.engine.summarize_with_escalation", summarize)
+    messages = _messages()
+    first_result = []
+    second_result = []
+    try:
+        engine_a.on_session_start("fence-session", conversation_id="fence-conversation", context_length=1_000)
+        engine_b.on_session_start("fence-session", conversation_id="fence-conversation", context_length=1_000)
+        engine_a.ingest(messages)
+
+        first = Thread(
+            target=lambda: first_result.append(
+                engine_a.compress(messages, current_tokens=engine_a.threshold_tokens + 1)
+            )
+        )
+        first.start()
+        assert started.wait(2.0)
+
+        external = sqlite3.connect(str(db_path), timeout=5.0)
+        try:
+            external.execute(
+                "UPDATE foreground_compaction_claims SET lease_expires_at = ? "
+                "WHERE conversation_id = ? AND session_id = ?",
+                (time.time() - 1.0, "fence-conversation", "fence-session"),
+            )
+            external.commit()
+        finally:
+            external.close()
+
+        second = Thread(
+            target=lambda: second_result.append(
+                engine_b.compress(messages, current_tokens=engine_b.threshold_tokens + 1)
+            )
+        )
+        second.start()
+        second.join(3.0)
+        assert not second.is_alive()
+        release_first.set()
+        first.join(3.0)
+        assert not first.is_alive()
+
+        nodes = [
+            node
+            for node in engine_a._dag.get_session_nodes("fence-session")
+            if node.source_type == "messages"
+        ]
+        assert len(calls) == 2
+        assert len(first_result) == 1
+        assert len(second_result) == 1
+        assert len(nodes) == 1
+        assert len(nodes[0].source_ids) == len(set(nodes[0].source_ids))
+        assert engine_a._async_compaction.connection.execute(
+            "SELECT next_token FROM foreground_compaction_fence WHERE fence_id = 1"
+        ).fetchone()[0] >= 2
+    except Exception as exc:
+        errors.append(exc)
+    finally:
+        release_first.set()
+        if first.is_alive():
+            first.join(3.0)
+        if 'second' in locals() and second.is_alive():
+            second.join(3.0)
+        engine_b.shutdown()
+        engine_a.shutdown()
+    assert not errors
+
+
+def test_foreground_publication_is_excluded_across_managers_when_async_disabled(tmp_path, monkeypatch):
+    """The foreground duplicate guard remains active without background prep."""
+    db_path = tmp_path / "foreground-disabled.db"
+    config = LCMConfig(
+        database_path=str(db_path),
+        fresh_tail_count=2,
+        leaf_chunk_tokens=20,
+        context_threshold=0.10,
+        async_background_compaction_enabled=False,
+        async_background_compaction_worker_enabled=False,
+    )
+    engine_a = LCMEngine(config=config)
+    engine_b = LCMEngine(config=config)
+    started = Event()
+    release = Event()
+    calls = []
+    errors = []
+
+    def summarize(**kwargs):
+        calls.append(kwargs)
+        if len(calls) == 1:
+            started.set()
+            assert release.wait(3.0)
+        return "disabled async foreground summary", 0
+
+    monkeypatch.setattr("hermes_lcm.engine.summarize_with_escalation", summarize)
+    messages = _messages()
+    results = []
+    try:
+        engine_a.on_session_start("disabled-race-session", conversation_id="disabled-race-conversation", context_length=1_000)
+        engine_b.on_session_start("disabled-race-session", conversation_id="disabled-race-conversation", context_length=1_000)
+        engine_a.ingest(messages)
+
+        first = Thread(
+            target=lambda: results.append(
+                engine_a.compress(messages, current_tokens=engine_a.threshold_tokens + 1)
+            )
+        )
+        second = Thread(
+            target=lambda: results.append(
+                engine_b.compress(messages, current_tokens=engine_b.threshold_tokens + 1)
+            )
+        )
+        first.start()
+        assert started.wait(2.0)
+        second.start()
+        time.sleep(0.15)
+        assert len(calls) == 1
+        release.set()
+        first.join(3.0)
+        second.join(3.0)
+        assert not first.is_alive()
+        assert not second.is_alive()
+        nodes = [
+            node
+            for node in engine_a._dag.get_session_nodes("disabled-race-session")
+            if node.source_type == "messages"
+        ]
+        assert len(results) == 2
+        assert len(nodes) == 1
+        assert engine_a.get_async_compaction_status()["enabled"] is False
+    except Exception as exc:
+        errors.append(exc)
+    finally:
+        release.set()
+        engine_b.shutdown()
+        engine_a.shutdown()
+    assert not errors
+
+
+def test_foreground_rebind_discards_hung_provider_without_writing_new_db(tmp_path, monkeypatch):
+    """A foreground operation finishing after rebind cannot publish into the new profile."""
+    home_a = tmp_path / "foreground-home-a"
+    home_b = tmp_path / "foreground-home-b"
+    config = LCMConfig(
+        database_path="",
+        fresh_tail_count=2,
+        leaf_chunk_tokens=20,
+        context_threshold=0.10,
+        async_background_compaction_enabled=False,
+    )
+    engine = LCMEngine(config=config, hermes_home=str(home_a))
+    started = Event()
+    release = Event()
+    errors = []
+
+    def blocked_summary(**kwargs):
+        started.set()
+        assert release.wait(3.0)
+        return "stale rebind summary", 0
+
+    monkeypatch.setattr("hermes_lcm.engine.summarize_with_escalation", blocked_summary)
+    messages = _messages()
+    result = []
+    try:
+        engine.on_session_start(
+            "old-session",
+            conversation_id="old-conversation",
+            hermes_home=str(home_a),
+            context_length=1_000,
+        )
+        engine.ingest(messages)
+        old_db = home_a / "lcm.db"
+        worker = Thread(
+            target=lambda: result.append(
+                engine.compress(messages, current_tokens=engine.threshold_tokens + 1)
+            )
+        )
+        worker.start()
+        assert started.wait(2.0)
+
+        rebound = Thread(
+            target=lambda: engine.on_session_start(
+                "new-session",
+                conversation_id="new-conversation",
+                hermes_home=str(home_b),
+                context_length=1_000,
+            )
+        )
+        rebound.start()
+        rebound.join(1.0)
+        assert not rebound.is_alive()
+        assert Path(engine._store.db_path) == home_b / "lcm.db"
+
+        release.set()
+        worker.join(3.0)
+        assert not worker.is_alive()
+        assert len(result) == 1
+        assert result[0] == messages
+
+        new_conn = sqlite3.connect(str(home_b / "lcm.db"))
+        try:
+            assert new_conn.execute(
+                "SELECT COUNT(*) FROM summary_nodes WHERE session_id = ?",
+                ("new-session",),
+            ).fetchone()[0] == 0
+        finally:
+            new_conn.close()
+        old_conn = sqlite3.connect(str(old_db))
+        try:
+            assert old_conn.execute(
+                "SELECT COUNT(*) FROM summary_nodes WHERE session_id = ?",
+                ("old-session",),
+            ).fetchone()[0] == 0
+        finally:
+            old_conn.close()
+    except Exception as exc:
+        errors.append(exc)
+    finally:
+        release.set()
+        engine.shutdown()
+    assert not errors
+
+
+def test_foreground_shutdown_is_bounded_and_discards_hung_provider_result(tmp_path, monkeypatch):
+    """Shutdown does not close a foreground operation's resources or leak its result."""
+    db_path = tmp_path / "foreground-shutdown.db"
+    config = LCMConfig(
+        database_path=str(db_path),
+        fresh_tail_count=2,
+        leaf_chunk_tokens=20,
+        context_threshold=0.10,
+        async_background_compaction_enabled=False,
+    )
+    engine = LCMEngine(config=config)
+    started = Event()
+    release = Event()
+    errors = []
+
+    def blocked_summary(**kwargs):
+        started.set()
+        assert release.wait(3.0)
+        return "stale shutdown summary", 0
+
+    monkeypatch.setattr("hermes_lcm.engine.summarize_with_escalation", blocked_summary)
+    messages = _messages()
+    result = []
+    worker = None
+    try:
+        engine.on_session_start("shutdown-session", conversation_id="shutdown-conversation", context_length=1_000)
+        engine.ingest(messages)
+        worker = Thread(
+            target=lambda: result.append(
+                engine.compress(messages, current_tokens=engine.threshold_tokens + 1)
+            )
+        )
+        worker.start()
+        assert started.wait(2.0)
+
+        shutdown = Thread(target=engine.shutdown)
+        shutdown.start()
+        shutdown.join(1.0)
+        assert not shutdown.is_alive()
+
+        release.set()
+        worker.join(3.0)
+        assert not worker.is_alive()
+        assert len(result) == 1
+        assert result[0] == messages
+        conn = sqlite3.connect(str(db_path))
+        try:
+            assert conn.execute(
+                "SELECT COUNT(*) FROM summary_nodes WHERE session_id = ?",
+                ("shutdown-session",),
+            ).fetchone()[0] == 0
+        finally:
+            conn.close()
+    except Exception as exc:
+        errors.append(exc)
+    finally:
+        release.set()
+        if worker is not None and worker.is_alive():
+            worker.join(3.0)
+        engine.shutdown()
+    assert not errors
+
+
 def test_promotion_yields_to_live_foreground_claim(tmp_path, monkeypatch):
     """A foreground claimant that wins first must block async promotion."""
     engine_a = _engine(tmp_path, session_id="promotion-foreground-session")

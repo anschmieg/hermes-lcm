@@ -23,6 +23,7 @@ from typing import Any, Callable, Dict, List
 
 from .db_bootstrap import (
     configure_connection,
+    ensure_foreground_compaction_claim_tables,
     ensure_async_compaction_tables,
     ensure_temporal_rollup_invalidation_triggers,
 )
@@ -223,10 +224,17 @@ class AsyncCompactionManager:
         )
         configure_connection(self._conn)
         self._conn.row_factory = sqlite3.Row
-        ensure_async_compaction_tables(self._conn)
+        self._background_tables_enabled = bool(
+            getattr(engine._config, "async_background_compaction_enabled", False)
+        )
+        if self._background_tables_enabled:
+            ensure_async_compaction_tables(self._conn)
+        else:
+            ensure_foreground_compaction_claim_tables(self._conn)
         if bool(getattr(engine._config, "temporal_rollups_enabled", False)):
             ensure_temporal_rollup_invalidation_triggers(self._conn)
-        self._recover_incomplete_batches()
+        if self._background_tables_enabled:
+            self._recover_incomplete_batches()
         worker_enabled = bool(
             getattr(engine._config, "async_background_compaction_worker_enabled", False)
         )
@@ -238,12 +246,15 @@ class AsyncCompactionManager:
                     int(getattr(engine._config, "async_background_compaction_max_batches", 2) or 2),
                 ),
             )
-            if worker_enabled
+            if worker_enabled and self._background_tables_enabled
             else None
         )
         self._enqueued_jobs = 0
         self._dropped_jobs = 0
         self._closed = False
+        self._close_requested = False
+        self._foreground_inflight = 0
+        self._foreground_claim = threading.local()
 
     @property
     def connection(self) -> sqlite3.Connection | None:
@@ -428,7 +439,7 @@ class AsyncCompactionManager:
             try:
                 existing = conn.execute(
                     """
-                    SELECT owner_id, lease_expires_at
+                    SELECT owner_id, lease_expires_at, fencing_token
                     FROM foreground_compaction_claims
                     WHERE conversation_id = ? AND session_id = ?
                     """,
@@ -456,35 +467,252 @@ class AsyncCompactionManager:
                     conn.rollback()
                     return False
 
+                existing_owner = str(existing["owner_id"] or "") if existing else ""
+                existing_expires = (
+                    float(existing["lease_expires_at"])
+                    if existing and existing["lease_expires_at"] is not None
+                    else 0.0
+                )
+                existing_token = int(existing["fencing_token"] or 0) if existing else 0
+                if (
+                    existing_owner == self._owner_id
+                    and existing_token > 0
+                    and existing_expires > now
+                ):
+                    fencing_token = existing_token
+                else:
+                    conn.execute(
+                        "UPDATE foreground_compaction_fence "
+                        "SET next_token = next_token + 1 WHERE fence_id = 1"
+                    )
+                    token_row = conn.execute(
+                        "SELECT next_token FROM foreground_compaction_fence WHERE fence_id = 1"
+                    ).fetchone()
+                    if token_row is None:
+                        raise RuntimeError("foreground compaction fence sequence is missing")
+                    fencing_token = int(token_row[0])
+
                 conn.execute(
                     """
                     INSERT INTO foreground_compaction_claims(
-                        conversation_id, session_id, owner_id, lease_expires_at
-                    ) VALUES (?, ?, ?, ?)
+                        conversation_id, session_id, owner_id, lease_expires_at,
+                        fencing_token
+                    ) VALUES (?, ?, ?, ?, ?)
                     ON CONFLICT(conversation_id, session_id) DO UPDATE SET
                         owner_id = excluded.owner_id,
-                        lease_expires_at = excluded.lease_expires_at
+                        lease_expires_at = excluded.lease_expires_at,
+                        fencing_token = excluded.fencing_token
                     """,
-                    (conversation_id, session_id, self._owner_id, lease_expires_at),
+                    (
+                        conversation_id,
+                        session_id,
+                        self._owner_id,
+                        lease_expires_at,
+                        fencing_token,
+                    ),
                 )
                 conn.commit()
+                self._foreground_claim.value = (
+                    conversation_id,
+                    session_id,
+                    fencing_token,
+                )
                 return True
             except Exception:
                 conn.rollback()
                 raise
 
-    def release_foreground_claims(self) -> None:
+    def foreground_claim_token(self) -> int | None:
+        claim = getattr(self._foreground_claim, "value", None)
+        return int(claim[2]) if claim is not None else None
+
+    def release_foreground_claims(self, claim_token: int | None = None) -> None:
+        if self._conn is None:
+            return
+        with self._lock:
+            try:
+                token = claim_token
+                claim = getattr(self._foreground_claim, "value", None)
+                if token is None and claim is not None:
+                    token = int(claim[2])
+                if token is None:
+                    self._conn.execute(
+                        "DELETE FROM foreground_compaction_claims WHERE owner_id = ?",
+                        (self._owner_id,),
+                    )
+                else:
+                    self._conn.execute(
+                        "DELETE FROM foreground_compaction_claims "
+                        "WHERE owner_id = ? AND fencing_token = ?",
+                        (self._owner_id, int(token)),
+                    )
+                self._conn.commit()
+            except sqlite3.Error:
+                self._conn.rollback()
+            finally:
+                if claim is None or token is None or int(claim[2]) == int(token):
+                    self._foreground_claim.value = None
+
+    def begin_foreground_operation(self) -> bool:
+        with self._lock:
+            if self._closed or self._conn is None:
+                return False
+            self._foreground_inflight += 1
+            return True
+
+    def invalidate_foreground_claim(
+        self,
+        *,
+        conversation_id: str,
+        session_id: str,
+    ) -> None:
+        """Fence claims for an identity that is leaving this engine binding."""
         if self._conn is None:
             return
         with self._lock:
             try:
                 self._conn.execute(
-                    "DELETE FROM foreground_compaction_claims WHERE owner_id = ?",
-                    (self._owner_id,),
+                    "DELETE FROM foreground_compaction_claims "
+                    "WHERE conversation_id = ? AND session_id = ?",
+                    (conversation_id, session_id),
                 )
                 self._conn.commit()
             except sqlite3.Error:
                 self._conn.rollback()
+
+    def end_foreground_operation(self) -> None:
+        with self._lock:
+            self._foreground_inflight = max(0, self._foreground_inflight - 1)
+            self._finish_close_locked()
+
+    def publish_foreground_node(
+        self,
+        node: SummaryNode,
+        *,
+        conversation_id: str,
+        session_id: str,
+        claim_token: int | None,
+        frontier_store_id: int = 0,
+        expected_generation: int | None = None,
+        config: Any | None = None,
+    ) -> bool:
+        """Publish one foreground node only while its SQLite fence is valid."""
+        if self._closed or self._conn is None or claim_token is None:
+            return False
+        source_ids = sorted(dict.fromkeys(int(value) for value in node.source_ids))
+        if not source_ids:
+            return False
+        placeholders = ",".join("?" for _ in source_ids)
+        now = time.time()
+        with self._lock:
+            conn = self._conn
+            if conn is None or self._closed:
+                return False
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                if (
+                    expected_generation is not None
+                    and int(getattr(self._engine, "_binding_generation", -1))
+                    != int(expected_generation)
+                ):
+                    conn.rollback()
+                    return False
+                claim = conn.execute(
+                    """
+                    SELECT owner_id, fencing_token, lease_expires_at
+                    FROM foreground_compaction_claims
+                    WHERE conversation_id = ? AND session_id = ?
+                    """,
+                    (conversation_id, session_id),
+                ).fetchone()
+                if (
+                    claim is None
+                    or str(claim["owner_id"] or "") != self._owner_id
+                    or int(claim["fencing_token"] or 0) != int(claim_token)
+                    or claim["lease_expires_at"] is None
+                    or float(claim["lease_expires_at"]) <= now
+                ):
+                    conn.rollback()
+                    return False
+                renewed = conn.execute(
+                    """
+                    UPDATE foreground_compaction_claims
+                    SET lease_expires_at = ?
+                    WHERE conversation_id = ? AND session_id = ?
+                      AND owner_id = ? AND fencing_token = ?
+                      AND lease_expires_at > ?
+                    """,
+                    (
+                        now
+                        + self._lease_seconds(
+                            config if config is not None else self._engine._config
+                        ),
+                        conversation_id,
+                        session_id,
+                        self._owner_id,
+                        int(claim_token),
+                        now,
+                    ),
+                )
+                if renewed.rowcount != 1:
+                    conn.rollback()
+                    return False
+
+                overlap = conn.execute(
+                    f"""
+                    SELECT 1 FROM summary_nodes AS node, json_each(node.source_ids) AS source
+                    WHERE node.session_id = ? AND node.source_type = ?
+                      AND CAST(source.value AS INTEGER) IN ({placeholders})
+                    LIMIT 1
+                    """,
+                    [session_id, node.source_type, *source_ids],
+                ).fetchone()
+                if overlap:
+                    conn.rollback()
+                    return False
+
+                cur = conn.execute(
+                    """
+                    INSERT INTO summary_nodes(
+                        session_id, depth, summary, token_count, source_token_count,
+                        source_ids, source_type, created_at, earliest_at, latest_at,
+                        expand_hint
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        session_id,
+                        node.depth,
+                        node.summary,
+                        node.token_count,
+                        node.source_token_count,
+                        json.dumps(source_ids),
+                        node.source_type,
+                        node.created_at or now,
+                        node.earliest_at,
+                        node.latest_at,
+                        node.expand_hint,
+                    ),
+                )
+                if node.source_type == "messages":
+                    conn.execute(
+                        """
+                        UPDATE lcm_lifecycle_state
+                        SET current_frontier_store_id = MAX(current_frontier_store_id, ?),
+                            updated_at = ?
+                        WHERE conversation_id = ? AND current_session_id = ?
+                        """,
+                        (int(frontier_store_id), now, conversation_id, session_id),
+                    )
+                    # Legacy/manual ContextEngine callers may have persisted
+                    # messages without binding lifecycle state. Preserve the
+                    # historical best-effort frontier behavior while keeping
+                    # the canonical node insert in this same transaction.
+                conn.commit()
+                node.node_id = int(cur.lastrowid)
+                return True
+            except Exception:
+                conn.rollback()
+                raise
 
     def capture_snapshot(
         self,
@@ -1197,19 +1425,55 @@ class AsyncCompactionManager:
         if not self._closed:
             return
         with self._lock:
-            conn = self._conn
-            if conn is None:
-                return
-            try:
-                conn.execute(
-                    "DELETE FROM foreground_compaction_claims WHERE owner_id = ?",
+            self._finish_close_locked()
+
+    def _finish_close_locked(self) -> None:
+        """Close only after workers and foreground operations release the manager."""
+        if not self._close_requested or self._foreground_inflight:
+            return
+        conn = self._conn
+        if conn is None:
+            return
+        try:
+            conn.execute(
+                "DELETE FROM foreground_compaction_claims WHERE owner_id = ?",
+                (self._owner_id,),
+            )
+            if self._background_tables_enabled:
+                owned_rows = conn.execute(
+                    """
+                    SELECT batch_id FROM compaction_batches
+                    WHERE state IN ('preparing', 'promoting') AND lease_owner = ?
+                    """,
                     (self._owner_id,),
+                ).fetchall()
+                owned_ids = [str(row[0]) for row in owned_rows]
+                conn.execute(
+                    """
+                    UPDATE compaction_batches
+                    SET state = 'pending', prepared_leaf_count = 0,
+                        lease_owner = NULL, lease_expires_at = NULL,
+                        updated_at = ?
+                    WHERE state IN ('preparing', 'promoting') AND lease_owner = ?
+                    """,
+                    (time.time(), self._owner_id),
                 )
-                conn.commit()
-            except sqlite3.Error:
-                conn.rollback()
-            conn.close()
-            self._conn = None
+                if owned_ids:
+                    placeholders = ",".join("?" for _ in owned_ids)
+                    conn.execute(
+                        f"DELETE FROM pending_summary_nodes WHERE batch_id IN ({placeholders})",
+                        owned_ids,
+                    )
+            conn.commit()
+        except sqlite3.Error:
+            conn.rollback()
+        try:
+            conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+        except sqlite3.Error:
+            pass
+        conn.close()
+        self._conn = None
+        self._close_requested = False
 
     def _run_snapshot(self, snapshot: _BackgroundSnapshot) -> None:
         try:
@@ -1607,9 +1871,13 @@ class AsyncCompactionManager:
         return self.promote(str(row[0]), messages)
 
     def status(self, conversation_id: str | None = None) -> Dict[str, Any]:
-        if self._closed or self._conn is None:
+        if (
+            self._closed
+            or self._conn is None
+            or not self._background_tables_enabled
+        ):
             return {
-                "enabled": bool(getattr(self._engine._config, "async_background_compaction_enabled", False)),
+                "enabled": self._background_tables_enabled,
                 "pending_batches": 0,
                 "prepared_batches": 0,
                 "promoted_batches": 0,
@@ -1697,9 +1965,10 @@ class AsyncCompactionManager:
         return True if worker is None else worker.drain(timeout)
 
     def close(self) -> None:
-        if self._closed:
+        if self._closed and not self._close_requested:
             return
         self._closed = True
+        self._close_requested = True
         worker = self._worker
         if worker is not None:
             # A live daemon callback still owns this manager connection. Wait
@@ -1709,43 +1978,4 @@ class AsyncCompactionManager:
                 logger.warning("LCM async compaction worker did not stop before shutdown")
                 return
         with self._lock:
-            conn = self._conn
-            if conn is not None:
-                try:
-                    conn.execute(
-                        "DELETE FROM foreground_compaction_claims WHERE owner_id = ?",
-                        (self._owner_id,),
-                    )
-                    owned_rows = conn.execute(
-                        """
-                        SELECT batch_id FROM compaction_batches
-                        WHERE state IN ('preparing', 'promoting') AND lease_owner = ?
-                        """,
-                        (self._owner_id,),
-                    ).fetchall()
-                    owned_ids = [str(row[0]) for row in owned_rows]
-                    conn.execute(
-                        """
-                        UPDATE compaction_batches
-                        SET state = 'pending', prepared_leaf_count = 0,
-                            lease_owner = NULL, lease_expires_at = NULL,
-                            updated_at = ?
-                        WHERE state IN ('preparing', 'promoting') AND lease_owner = ?
-                        """,
-                        (time.time(), self._owner_id),
-                    )
-                    if owned_ids:
-                        placeholders = ",".join("?" for _ in owned_ids)
-                        conn.execute(
-                            f"DELETE FROM pending_summary_nodes WHERE batch_id IN ({placeholders})",
-                            owned_ids,
-                        )
-                    conn.commit()
-                except sqlite3.Error:
-                    conn.rollback()
-                try:
-                    conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
-                except sqlite3.Error:
-                    pass
-                conn.close()
-                self._conn = None
+            self._finish_close_locked()
