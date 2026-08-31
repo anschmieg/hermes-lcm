@@ -6,6 +6,7 @@ import json
 import sqlite3
 import time
 from queue import Queue
+from pathlib import Path
 from threading import Event, Thread
 
 import pytest
@@ -452,6 +453,111 @@ def test_concurrent_managers_claim_one_preparer_for_a_batch(tmp_path, monkeypatc
         engine_a.shutdown()
 
 
+def test_two_engines_do_not_foreground_publish_after_promotion_miss(tmp_path, monkeypatch):
+    """A promotion miss must not let a second engine publish overlapping leaves."""
+    engine_a = _engine(tmp_path, session_id="shared-foreground-session")
+    engine_b = _engine(tmp_path, session_id="shared-foreground-session")
+    promoted = Event()
+    original_promote_next = engine_a._async_compaction.promote_next
+
+    def promote_a(messages):
+        result = original_promote_next(messages)
+        if result is not None and result.promoted:
+            promoted.set()
+        return result
+
+    engine_a._async_compaction.promote_next = promote_a
+    monkeypatch.setattr(
+        "hermes_lcm.engine.summarize_with_escalation",
+        lambda **kwargs: ("foreground race summary", 0),
+    )
+    messages = _messages()
+    try:
+        engine_a.ingest(messages)
+        batch = engine_a.prepare_background_compaction_once(messages)
+        assert batch is not None
+
+        engine_a._last_compression_status = "pending"
+        engine_b._last_compression_status = "pending"
+        results = []
+
+        first = Thread(
+            target=lambda: results.append(
+                engine_a.compress(messages, current_tokens=engine_a.threshold_tokens + 1)
+            )
+        )
+
+        def run_second():
+            assert promoted.wait(3.0)
+            results.append(
+                engine_b.compress(messages, current_tokens=engine_b.threshold_tokens + 1)
+            )
+
+        second = Thread(target=run_second)
+        first.start()
+        second.start()
+        first.join(5.0)
+        second.join(5.0)
+
+        assert len(results) == 2
+        nodes = [
+            node
+            for node in engine_a._dag.get_session_nodes("shared-foreground-session")
+            if node.source_type == "messages"
+        ]
+        source_sets = [set(node.source_ids) for node in nodes]
+        assert len(nodes) == batch.expected_leaf_count
+        assert all(not (left & right) for index, left in enumerate(source_sets) for right in source_sets[index + 1:])
+    finally:
+        engine_b.shutdown()
+        engine_a.shutdown()
+
+
+def test_promotion_yields_to_live_foreground_claim(tmp_path, monkeypatch):
+    """A foreground claimant that wins first must block async promotion."""
+    engine_a = _engine(tmp_path, session_id="promotion-foreground-session")
+    engine_b = _engine(tmp_path, session_id="promotion-foreground-session")
+    claim_entered = Event()
+    release_claim = Event()
+    original_claim = engine_b._async_compaction.claim_foreground_sources
+
+    def claim_and_hold(**kwargs):
+        assert original_claim(**kwargs)
+        claim_entered.set()
+        assert release_claim.wait(3.0)
+        return True
+
+    engine_b._async_compaction.claim_foreground_sources = claim_and_hold
+    monkeypatch.setattr(
+        "hermes_lcm.engine.summarize_with_escalation",
+        lambda **kwargs: ("foreground claim wins", 0),
+    )
+    messages = _messages()
+    worker = Thread(
+        target=lambda: engine_b.compress(
+            messages,
+            current_tokens=engine_b.threshold_tokens + 1,
+        )
+    )
+    try:
+        engine_a.ingest(messages)
+        batch = engine_a.prepare_background_compaction_once(messages)
+        assert batch is not None
+        engine_b._last_compression_status = "running"
+        worker.start()
+        assert claim_entered.wait(3.0)
+
+        result = engine_a.promote_prepared_compaction(batch.batch_id, messages)
+
+        assert result.promoted is False
+        assert result.reason == "foreground_compaction_in_progress"
+    finally:
+        release_claim.set()
+        worker.join(5.0)
+        engine_b.shutdown()
+        engine_a.shutdown()
+
+
 def test_recovery_does_not_reject_another_live_preparer(tmp_path):
     """Opening a second manager must leave a non-expired lease untouched."""
     config = LCMConfig(
@@ -730,6 +836,80 @@ def test_turn_callback_does_not_deepcopy_transcript(tmp_path, monkeypatch):
         engine.shutdown()
 
 
+@pytest.mark.parametrize("lock_name", ("state", "manager"))
+def test_on_turn_complete_does_not_wait_for_runtime_locks(tmp_path, lock_name):
+    """Reply completion stays bounded while lifecycle or manager locks are held."""
+    config = LCMConfig(
+        database_path=str(tmp_path / f"callback-lock-{lock_name}.db"),
+        async_background_compaction_enabled=True,
+        async_background_compaction_worker_enabled=True,
+    )
+    engine = LCMEngine(config=config)
+    engine.on_session_start(
+        "callback-lock-session",
+        conversation_id="callback-lock-conversation",
+        context_length=1_000,
+    )
+    lock = engine._async_state_lock if lock_name == "state" else engine._async_compaction._lock
+    returned = Event()
+    result = []
+    messages = [{"role": "user", "content": "reply completed"}]
+    lock.acquire()
+    try:
+        callback_thread = Thread(
+            target=lambda: (result.append(engine.on_turn_complete(messages)), returned.set())
+        )
+        callback_thread.start()
+        assert returned.wait(0.2)
+        assert result == [True]
+        callback_thread.join(1.0)
+    finally:
+        lock.release()
+        engine.shutdown()
+
+
+def test_on_turn_complete_does_not_capture_snapshot_under_sqlite_contention(tmp_path, monkeypatch):
+    """SQLite/snapshot work is deferred until after the cheap trigger enqueue."""
+    config = LCMConfig(
+        database_path=str(tmp_path / "callback-sqlite-lock.db"),
+        async_background_compaction_enabled=True,
+        async_background_compaction_worker_enabled=True,
+    )
+    engine = LCMEngine(config=config)
+    engine.on_session_start(
+        "callback-sqlite-session",
+        conversation_id="callback-sqlite-conversation",
+        context_length=1_000,
+    )
+    snapshot_started = Event()
+    release_snapshot = Event()
+
+    def blocked_snapshot(*args, **kwargs):
+        snapshot_started.set()
+        assert release_snapshot.wait(2.0)
+        return None
+
+    monkeypatch.setattr(engine._async_compaction, "capture_snapshot", blocked_snapshot)
+    sqlite_lock = sqlite3.connect(config.database_path, timeout=0.1)
+    sqlite_lock.execute("BEGIN IMMEDIATE")
+    returned = Event()
+    result = []
+    try:
+        callback_thread = Thread(
+            target=lambda: (result.append(engine.on_turn_complete([{"role": "user", "content": "done"}]),), returned.set())
+        )
+        callback_thread.start()
+        assert returned.wait(0.2)
+        assert result == [True]
+        assert snapshot_started.wait(1.0)
+    finally:
+        release_snapshot.set()
+        callback_thread.join(2.0)
+        sqlite_lock.rollback()
+        sqlite_lock.close()
+        engine.shutdown()
+
+
 def test_worker_drain_tracks_a_dequeued_job_as_in_flight():
     """Drain cannot report idle in the dequeue/active-state handoff window."""
     release = Event()
@@ -777,6 +957,104 @@ def test_manager_does_not_close_connection_if_worker_did_not_stop(tmp_path):
         engine._async_compaction = None
         if connection is not None:
             connection.close()
+        engine.shutdown()
+
+
+def test_shutdown_is_bounded_with_hung_summarizer(tmp_path, monkeypatch):
+    """Shutdown returns before a live daemon worker releases its provider call."""
+    config = LCMConfig(
+        database_path=str(tmp_path / "hung-shutdown.db"),
+        fresh_tail_count=2,
+        leaf_chunk_tokens=20,
+        async_background_compaction_enabled=True,
+        async_background_compaction_worker_enabled=True,
+    )
+    engine = LCMEngine(config=config)
+    engine.on_session_start("hung-shutdown-session", conversation_id="hung-shutdown-conversation", context_length=1_000)
+    started = Event()
+    release = Event()
+
+    def blocked_summary(**kwargs):
+        started.set()
+        assert release.wait(3.0)
+        return "eventual summary", 0
+
+    monkeypatch.setattr("hermes_lcm.engine.summarize_with_escalation", blocked_summary)
+    manager = engine._async_compaction
+    messages = _messages()
+    engine.ingest(messages)
+    assert engine.on_turn_complete(messages) is True
+    assert started.wait(2.0)
+    connection = manager.connection
+    shutdown_returned = Event()
+    shutdown_thread = Thread(target=lambda: (engine.shutdown(), shutdown_returned.set()))
+    shutdown_thread.start()
+    try:
+        assert shutdown_returned.wait(0.4)
+        assert connection is not None
+        assert connection.execute("SELECT 1").fetchone()[0] == 1
+        assert manager._worker._thread.daemon is True
+    finally:
+        release.set()
+        shutdown_thread.join(3.0)
+        manager.drain(timeout=3.0)
+
+
+def test_storage_rebind_is_bounded_with_hung_summarizer(tmp_path, monkeypatch):
+    """Profile rebind leaves a live worker's SQLite connection untouched."""
+    home_a = tmp_path / "profile-a"
+    home_b = tmp_path / "profile-b"
+    config = LCMConfig(
+        database_path="",
+        fresh_tail_count=2,
+        leaf_chunk_tokens=20,
+        async_background_compaction_enabled=True,
+        async_background_compaction_worker_enabled=True,
+    )
+    engine = LCMEngine(config=config, hermes_home=str(home_a))
+    engine.on_session_start(
+        "hung-rebind-session",
+        conversation_id="hung-rebind-conversation",
+        hermes_home=str(home_a),
+        context_length=1_000,
+    )
+    started = Event()
+    release = Event()
+
+    def blocked_summary(**kwargs):
+        started.set()
+        assert release.wait(3.0)
+        return "eventual rebind summary", 0
+
+    monkeypatch.setattr("hermes_lcm.engine.summarize_with_escalation", blocked_summary)
+    old_manager = engine._async_compaction
+    old_connection = old_manager.connection
+    messages = _messages()
+    engine.ingest(messages)
+    assert engine.on_turn_complete(messages) is True
+    assert started.wait(2.0)
+    rebind_returned = Event()
+    rebind_thread = Thread(
+        target=lambda: (
+            engine.on_session_start(
+                "rebound-session",
+                conversation_id="rebound-conversation",
+                hermes_home=str(home_b),
+                context_length=1_000,
+            ),
+            rebind_returned.set(),
+        )
+    )
+    rebind_thread.start()
+    try:
+        assert rebind_returned.wait(0.4)
+        assert Path(engine._store.db_path) == home_b / "lcm.db"
+        assert old_connection is not None
+        assert old_connection.execute("SELECT 1").fetchone()[0] == 1
+    finally:
+        release.set()
+        rebind_thread.join(3.0)
+        old_manager.drain(timeout=3.0)
         engine.shutdown()
 
 
@@ -873,6 +1151,35 @@ def test_policy_fingerprint_rejects_session_filter_changes(tmp_path):
         engine.shutdown()
 
 
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("large_output_externalization_path", "/tmp/changed-lcm-payloads"),
+        ("summary_circuit_breaker_failure_threshold", 7),
+        ("summary_circuit_breaker_cooldown_seconds", 17),
+        ("summary_spend_max_calls", 3),
+        ("summary_spend_window_seconds", 17.5),
+        ("summary_spend_backoff_seconds", 27.5),
+    ),
+)
+def test_policy_fingerprint_rejects_preparation_setting_changes(tmp_path, field, value):
+    """Every preparation route/guard setting participates in promotion identity."""
+    engine = _engine(tmp_path, session_id=f"fingerprint-{field}")
+    try:
+        messages = _messages()
+        engine.ingest(messages)
+        batch = engine.prepare_background_compaction_once(messages)
+        setattr(engine._config, field, value)
+
+        result = engine.promote_prepared_compaction(batch.batch_id, messages)
+
+        assert result.promoted is False
+        assert result.reason == "policy_fingerprint_mismatch"
+        assert engine._dag.get_session_node_count(engine.current_session_id) == 0
+    finally:
+        engine.shutdown()
+
+
 def test_rescue_shrinkage_cannot_publish_partial_batch(tmp_path, monkeypatch):
     engine = _engine(tmp_path, session_id="rescue-session")
     try:
@@ -906,7 +1213,11 @@ def test_async_publication_runs_rollup_and_transcript_gc_hooks_after_commit(tmp_
     engine = LCMEngine(config=config)
     rollup_nodes = []
     gc_calls = []
-    monkeypatch.setattr(engine, "_invalidate_rollups_for_published_node", lambda node: rollup_nodes.append(node))
+    monkeypatch.setattr(
+        engine,
+        "_invalidate_rollups_for_published_node",
+        lambda node, **kwargs: rollup_nodes.append(node),
+    )
     monkeypatch.setattr(
         engine,
         "_maybe_gc_compacted_tool_results",
@@ -924,6 +1235,80 @@ def test_async_publication_runs_rollup_and_transcript_gc_hooks_after_commit(tmp_
         assert len(rollup_nodes) == batch.expected_leaf_count
         assert len(gc_calls) == batch.expected_leaf_count
     finally:
+        engine.shutdown()
+
+
+def test_post_publish_maintenance_uses_publication_snapshot_after_rebind(tmp_path, monkeypatch):
+    """Maintenance keeps the published batch binding when the engine rebinds."""
+    config = LCMConfig(
+        database_path=str(tmp_path / "maintenance-race.db"),
+        fresh_tail_count=2,
+        leaf_chunk_tokens=20,
+        async_background_compaction_enabled=True,
+        temporal_rollups_enabled=True,
+        large_output_transcript_gc_enabled=True,
+    )
+    engine = LCMEngine(config=config)
+    hook_started = Event()
+    rebound = Event()
+    rollup_calls = []
+    gc_calls = []
+
+    def rollup_hook(node, **kwargs):
+        hook_started.set()
+        assert rebound.wait(3.0)
+        rollup_calls.append((node, kwargs))
+
+    def gc_hook(compacted, source_ids, **kwargs):
+        gc_calls.append((compacted, source_ids, kwargs))
+
+    monkeypatch.setattr(engine, "_invalidate_rollups_for_published_node", rollup_hook)
+    monkeypatch.setattr(engine, "_maybe_gc_compacted_tool_results", gc_hook)
+    monkeypatch.setattr(
+        "hermes_lcm.engine.summarize_with_escalation",
+        lambda **kwargs: ("snapshot maintenance summary", 0),
+    )
+    messages = _messages()
+
+    def rebind():
+        assert hook_started.wait(3.0)
+        engine.on_session_start(
+            "maintenance-new-session",
+            conversation_id="maintenance-new-conversation",
+            context_length=1_000,
+        )
+        engine._config.temporal_rollups_enabled = False
+        engine._config.large_output_transcript_gc_enabled = False
+        rebound.set()
+
+    rebind_thread = Thread(target=rebind)
+    rebind_thread.start()
+    try:
+        engine.on_session_start(
+            "maintenance-session",
+            conversation_id="maintenance-conversation",
+            context_length=1_000,
+        )
+        engine.ingest(messages)
+        batch = engine.prepare_background_compaction_once(messages)
+
+        result = engine.promote_prepared_compaction(batch.batch_id, messages)
+
+        assert result.promoted is True
+        rebind_thread.join(3.0)
+        assert rebound.is_set()
+        assert rollup_calls
+        assert gc_calls
+        rollup_kwargs = rollup_calls[0][1]
+        gc_kwargs = gc_calls[0][2]
+        assert rollup_kwargs["session_id"] == "maintenance-session"
+        assert rollup_kwargs["config"].temporal_rollups_enabled is True
+        assert gc_kwargs["session_id"] == "maintenance-session"
+        assert gc_kwargs["config"].large_output_transcript_gc_enabled is True
+        assert gc_kwargs["hermes_home"] == engine._hermes_home
+    finally:
+        rebound.set()
+        rebind_thread.join(3.0)
         engine.shutdown()
 
 

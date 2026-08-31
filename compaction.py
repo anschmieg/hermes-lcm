@@ -363,6 +363,13 @@ class CompactionMixin:
             self._last_compression_status = "error"
             self._last_compression_noop_reason = ""
             raise
+        finally:
+            claim_manager = getattr(self._thread_context, "foreground_claim_manager", None)
+            if claim_manager is not None:
+                try:
+                    claim_manager.release_foreground_claims()
+                finally:
+                    self._thread_context.foreground_claim_manager = None
 
     def _compress_impl(self, messages: List[Dict[str, Any]],
                        current_tokens: int = None,
@@ -524,6 +531,7 @@ class CompactionMixin:
         # requested compression. Direct calls to ``compress`` remain the
         # synchronous compatibility path, which also gives a foreground call
         # deterministic precedence over manually prepared test/operator work.
+        async_manager = None
         if preflight_requested and not force_overflow:
             try:
                 async_manager = getattr(self, "_async_compaction_manager", lambda: None)()
@@ -559,6 +567,14 @@ class CompactionMixin:
                         leaf_compacted_this_turn = True
                         leaf_passes = async_batch.expected_leaf_count
                         max_leaf_passes = 0
+
+        if async_manager is None and bool(
+            getattr(self._config, "async_background_compaction_enabled", False)
+        ):
+            try:
+                async_manager = self._async_compaction_manager()
+            except Exception:
+                async_manager = None
 
         explicit_focus_topic = focus_topic is not None
 
@@ -738,6 +754,20 @@ class CompactionMixin:
                 break
 
             selected_raw_chunk = to_compact
+            if async_manager is not None:
+                if getattr(self._thread_context, "foreground_claim_manager", None) is None:
+                    source_ids = self._get_store_ids_for_messages(selected_raw_chunk)
+                    if not async_manager.claim_foreground_sources(
+                        conversation_id=self._conversation_id,
+                        session_id=self._session_id,
+                        source_ids=source_ids,
+                        config=self._config,
+                    ):
+                        self._last_compression_status = "noop"
+                        self._last_compression_noop_reason = "foreground compaction claim lost"
+                        noop_reason = "foreground compaction claim lost"
+                        break
+                    self._thread_context.foreground_claim_manager = async_manager
             summary_input_chunk = [
                 message for message in selected_raw_chunk if id(message) not in dependent_reply_message_ids
             ]

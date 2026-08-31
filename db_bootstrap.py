@@ -978,6 +978,14 @@ def ensure_async_compaction_tables(conn: sqlite3.Connection) -> None:
 
         CREATE INDEX IF NOT EXISTS idx_pending_summary_nodes_batch_range
             ON pending_summary_nodes(batch_id, source_range_start_store_id);
+
+        CREATE TABLE IF NOT EXISTS foreground_compaction_claims (
+            conversation_id TEXT NOT NULL,
+            session_id TEXT NOT NULL,
+            owner_id TEXT NOT NULL,
+            lease_expires_at REAL NOT NULL,
+            PRIMARY KEY(conversation_id, session_id)
+        );
         """
     )
     columns = {

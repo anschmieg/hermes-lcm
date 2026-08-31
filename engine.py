@@ -1672,14 +1672,16 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         bounded enqueue. Hosts that call it directly must still use ``ingest``
         when they need durable raw-message persistence.
         """
-        # Do not materialize the manager here.  Normal enabled engines create it
-        # during storage binding; a runtime config toggle must not turn this
-        # bounded callback into a schema/recovery operation.
-        with self._async_state_lock:
-            manager = self._async_compaction
-            if manager is None or not messages or self._session_ignored or self._session_stateless:
-                return False
-            return manager.enqueue()
+        # Do not materialize the manager or capture state here. Normal enabled
+        # engines create the manager during storage binding; this path only
+        # copies two short identity strings into the manager's bounded queue.
+        manager = self._async_compaction
+        if manager is None or not messages or self._session_ignored or self._session_stateless:
+            return False
+        return manager.enqueue_trigger(
+            str(self._session_id or ""),
+            str(self._conversation_id or ""),
+        )
 
     def prepare_background_compaction_once(
         self,
@@ -1989,7 +1991,14 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         ):
             self._schedule_rollup_maintenance(session_id)
 
-    def _invalidate_rollups_for_published_node(self, node: "SummaryNode") -> None:
+    def _invalidate_rollups_for_published_node(
+        self,
+        node: "SummaryNode",
+        *,
+        config: Any | None = None,
+        dag: Any | None = None,
+        session_id: str | None = None,
+    ) -> None:
         """Stale the rollups covering EVERY UTC day a just-published node spans.
 
         Rollups consume published summary nodes, so publication — not raw ingest
@@ -2000,11 +2009,13 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         crossing midnight stales BOTH days, not only its newest (maintainer #388
         blocker 2 / B2).
         """
-        if not self._config.temporal_rollups_enabled:
+        active_config = self._config if config is None else config
+        active_dag = self._dag if dag is None else dag
+        if not active_config.temporal_rollups_enabled or active_dag is None:
             return
         mark_stale_for_published_summary(
-            self._dag,
-            str(node.session_id or ""),
+            active_dag,
+            str(node.session_id if session_id is None else session_id or ""),
             node.latest_at,
             node.created_at,
             earliest_at=node.earliest_at,
@@ -3752,6 +3763,8 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         store_ids: "list[int]",
         *,
         connection: "sqlite3.Connection | None" = None,
+        config: Any | None = None,
+        store: Any | None = None,
     ) -> None:
         """Soft-archive raw-history chunks for purged/GC'd messages (best effort).
 
@@ -3763,7 +3776,9 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         """
         if not store_ids:
             return
-        if not bool(getattr(self._config, "embeddings_enabled", False)):
+        active_config = self._config if config is None else config
+        active_store = self._store if store is None else store
+        if not bool(getattr(active_config, "embeddings_enabled", False)):
             return
         try:
             from .vector_store import VectorStore
@@ -3774,7 +3789,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                         connection, store_ids[offset:offset + 256]
                     )
                 return
-            store = VectorStore(self._store.db_path, config=self._config)
+            store = VectorStore(active_store.db_path, config=active_config)
             try:
                 store.archive_chunks_for_messages(store_ids)
             finally:
@@ -5215,24 +5230,35 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self,
         compacted_chunk: List[Dict[str, Any]],
         source_store_ids: List[int],
+        *,
+        config: Any | None = None,
+        session_id: str | None = None,
+        hermes_home: str | None = None,
+        store: Any | None = None,
     ) -> None:
-        if not getattr(self._config, "large_output_transcript_gc_enabled", False):
+        active_config = self._config if config is None else config
+        active_session_id = self._session_id if session_id is None else session_id
+        active_hermes_home = self._hermes_home if hermes_home is None else hermes_home
+        active_store = self._store if store is None else store
+        if not getattr(active_config, "large_output_transcript_gc_enabled", False):
             return
         if not compacted_chunk or not source_store_ids:
             return
 
-        stored_by_id = self._store.get_batch(source_store_ids)
+        stored_by_id = active_store.get_batch(source_store_ids)
 
         def _archive_in_rewrite_txn(conn: "sqlite3.Connection", sid: int) -> None:
             # Runs inside gc_externalized_tool_result's write transaction, right
             # after the content rewrite and before its commit: archive this row's
             # now-stale chunks ATOMICALLY with the rewrite so a recall can never
             # slice the new (short) content at the old chunk offsets (F2).
-            self._archive_chunks_for_messages([sid], connection=conn)
+            self._archive_chunks_for_messages(
+                [sid], connection=conn, config=active_config, store=active_store
+            )
 
         for store_id in source_store_ids:
             stored = stored_by_id.get(store_id)
-            if not stored or stored.get("session_id") != self._session_id:
+            if not stored or stored.get("session_id") != active_session_id:
                 continue
             if stored.get("role") != "tool":
                 continue
@@ -5251,12 +5277,12 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             if ref:
                 externalized = load_externalized_payload(
                     ref,
-                    config=self._config,
-                    hermes_home=self._hermes_home,
+                    config=active_config,
+                    hermes_home=active_hermes_home,
                 )
                 if externalized is not None and externalized.get("kind", "tool_result") == "tool_result":
                     placeholder = build_transcript_gc_placeholder(externalized)
-                    self._store.gc_externalized_tool_result(
+                    active_store.gc_externalized_tool_result(
                         store_id, placeholder, before_commit=_archive_in_rewrite_txn
                     )
                     continue
@@ -5272,9 +5298,9 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 externalized = find_externalized_payload_for_message(
                     candidate,
                     tool_call_id=tool_call_id,
-                    session_id=self._session_id,
-                    config=self._config,
-                    hermes_home=self._hermes_home,
+                    session_id=active_session_id,
+                    config=active_config,
+                    hermes_home=active_hermes_home,
                 )
                 if externalized is not None:
                     break
@@ -5282,7 +5308,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 continue
 
             placeholder = build_transcript_gc_placeholder(externalized)
-            self._store.gc_externalized_tool_result(
+            active_store.gc_externalized_tool_result(
                 store_id, placeholder, before_commit=_archive_in_rewrite_txn
             )
 

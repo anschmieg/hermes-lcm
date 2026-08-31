@@ -30,13 +30,15 @@ from .fresh_tail import resolve_fresh_tail_boundary
 from .message_content import stored_text_content_for_pattern_matching
 from .message_patterns import compile_message_patterns, matches_message_pattern
 from .escalation import SummaryCircuitBreaker, SummarySpendGuard
-from .dag import SummaryNode
+from .dag import SummaryDAG, SummaryNode
+from .store import MessageStore
 from .tokens import count_message_tokens, count_messages_tokens, count_tokens
 
 logger = logging.getLogger(__name__)
 
 _PROTOCOL_VERSION = "async_compaction_protocol_v1"
 _ACTIVE_BATCH_STATES = ("pending", "preparing", "ready")
+_WORKER_CLOSE_TIMEOUT_SECONDS = 0.25
 
 
 @dataclass
@@ -91,12 +93,20 @@ class _BackgroundSnapshot:
     raw_context_length: int = 0
 
 
+@dataclass(frozen=True)
+class _BackgroundTrigger:
+    """Small immutable reply-path signal; durable state is read by the worker."""
+
+    session_id: str
+    conversation_id: str
+
+
 class _BoundedBackgroundWorker:
     """One daemon worker with non-blocking bounded enqueue and safe draining."""
 
-    def __init__(self, callback: Callable[[_BackgroundSnapshot], None], max_items: int):
+    def __init__(self, callback: Callable[[Any], None], max_items: int):
         self._callback = callback
-        self._queue: queue.Queue[_BackgroundSnapshot] = queue.Queue(maxsize=max(1, max_items))
+        self._queue: queue.Queue[Any] = queue.Queue(maxsize=max(1, max_items))
         self._condition = threading.Condition()
         self._active = False
         self._stopping = False
@@ -111,13 +121,27 @@ class _BoundedBackgroundWorker:
         with self._condition:
             return self._active
 
-    def enqueue(self, snapshot: _BackgroundSnapshot) -> bool:
-        with self._condition:
+    def _try_enqueue(self, trigger: Any) -> bool:
+        """Append without waiting on Queue's internal mutex."""
+        if not self._queue.mutex.acquire(blocking=False):
+            return False
+        try:
+            if self._queue.maxsize > 0 and len(self._queue.queue) >= self._queue.maxsize:
+                return False
+            self._queue.queue.append(trigger)
+            self._queue.unfinished_tasks += 1
+            self._queue.not_empty.notify()
+            return True
+        finally:
+            self._queue.mutex.release()
+
+    def enqueue(self, trigger: Any) -> bool:
+        if not self._condition.acquire(blocking=False):
+            return False
+        try:
             if self._stopping:
                 return False
-            try:
-                self._queue.put_nowait(snapshot)
-            except queue.Full:
+            if not self._try_enqueue(trigger):
                 return False
             if self._thread is None or not self._thread.is_alive():
                 self._thread = threading.Thread(
@@ -128,6 +152,8 @@ class _BoundedBackgroundWorker:
                 self._thread.start()
             self._condition.notify_all()
             return True
+        finally:
+            self._condition.release()
 
     def _run(self) -> None:
         while True:
@@ -201,7 +227,20 @@ class AsyncCompactionManager:
         if bool(getattr(engine._config, "temporal_rollups_enabled", False)):
             ensure_temporal_rollup_invalidation_triggers(self._conn)
         self._recover_incomplete_batches()
-        self._worker: _BoundedBackgroundWorker | None = None
+        worker_enabled = bool(
+            getattr(engine._config, "async_background_compaction_worker_enabled", False)
+        )
+        self._worker: _BoundedBackgroundWorker | None = (
+            _BoundedBackgroundWorker(
+                self._run_trigger,
+                max_items=max(
+                    1,
+                    int(getattr(engine._config, "async_background_compaction_max_batches", 2) or 2),
+                ),
+            )
+            if worker_enabled
+            else None
+        )
         self._enqueued_jobs = 0
         self._dropped_jobs = 0
         self._closed = False
@@ -261,6 +300,11 @@ class AsyncCompactionManager:
         ).encode("utf-8")
         return hashlib.sha256(payload).hexdigest()
 
+    @staticmethod
+    def _setting(config: Any, name: str, default: Any) -> Any:
+        value = getattr(config, name, None)
+        return default if value is None else value
+
     def _policy_fingerprint(self, snapshot: _BackgroundSnapshot | None = None) -> str:
         config = snapshot.config if snapshot is not None and snapshot.config is not None else self._engine._config
         runtime_threshold_tokens = getattr(self._engine, "threshold_tokens", 0)
@@ -293,9 +337,27 @@ class AsyncCompactionManager:
             "large_output_externalization_threshold_chars": int(
                 getattr(config, "large_output_externalization_threshold_chars", 0) or 0
             ),
+            "large_output_externalization_path": str(
+                getattr(config, "large_output_externalization_path", "") or ""
+            ),
             "custom_instructions": str(getattr(config, "custom_instructions", "") or ""),
             "l2_budget_ratio": float(getattr(config, "l2_budget_ratio", 0.0) or 0.0),
             "l3_truncate_tokens": int(getattr(config, "l3_truncate_tokens", 0) or 0),
+            "summary_circuit_breaker_failure_threshold": int(
+                self._setting(config, "summary_circuit_breaker_failure_threshold", 2)
+            ),
+            "summary_circuit_breaker_cooldown_seconds": int(
+                self._setting(config, "summary_circuit_breaker_cooldown_seconds", 300)
+            ),
+            "summary_spend_max_calls": int(
+                self._setting(config, "summary_spend_max_calls", 24)
+            ),
+            "summary_spend_window_seconds": float(
+                self._setting(config, "summary_spend_window_seconds", 600.0)
+            ),
+            "summary_spend_backoff_seconds": float(
+                self._setting(config, "summary_spend_backoff_seconds", 1800.0)
+            ),
             "ignore_session_patterns": list(getattr(config, "ignore_session_patterns", []) or []),
             "ignore_session_patterns_source": str(
                 getattr(config, "ignore_session_patterns_source", "default") or "default"
@@ -344,7 +406,90 @@ class AsyncCompactionManager:
         summary_window = float(getattr(config, "summary_timeout_ms", 60_000) or 60_000) / 1000.0 + 30.0
         return max(1.0, configured, summary_window)
 
-    def capture_snapshot(self) -> _BackgroundSnapshot:
+    def claim_foreground_sources(
+        self,
+        *,
+        conversation_id: str,
+        session_id: str,
+        source_ids: list[int],
+        config: Any,
+    ) -> bool:
+        """Claim one synchronous source window across managers/processes."""
+        if self._closed or not source_ids:
+            return False
+        conn = self._conn
+        assert conn is not None
+        now = time.time()
+        lease_expires_at = now + self._lease_seconds(config)
+        source_ids = sorted(dict.fromkeys(int(value) for value in source_ids))
+        placeholders = ",".join("?" for _ in source_ids)
+        with self._lock:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                existing = conn.execute(
+                    """
+                    SELECT owner_id, lease_expires_at
+                    FROM foreground_compaction_claims
+                    WHERE conversation_id = ? AND session_id = ?
+                    """,
+                    (conversation_id, session_id),
+                ).fetchone()
+                if existing and str(existing["owner_id"] or "") != self._owner_id:
+                    if existing["lease_expires_at"] is not None and float(
+                        existing["lease_expires_at"]
+                    ) > now:
+                        conn.rollback()
+                        return False
+
+                overlap = conn.execute(
+                    f"""
+                    SELECT 1
+                    FROM summary_nodes AS node, json_each(node.source_ids) AS source
+                    WHERE node.session_id = ?
+                      AND node.source_type = 'messages'
+                      AND CAST(source.value AS INTEGER) IN ({placeholders})
+                    LIMIT 1
+                    """,
+                    [session_id, *source_ids],
+                ).fetchone()
+                if overlap:
+                    conn.rollback()
+                    return False
+
+                conn.execute(
+                    """
+                    INSERT INTO foreground_compaction_claims(
+                        conversation_id, session_id, owner_id, lease_expires_at
+                    ) VALUES (?, ?, ?, ?)
+                    ON CONFLICT(conversation_id, session_id) DO UPDATE SET
+                        owner_id = excluded.owner_id,
+                        lease_expires_at = excluded.lease_expires_at
+                    """,
+                    (conversation_id, session_id, self._owner_id, lease_expires_at),
+                )
+                conn.commit()
+                return True
+            except Exception:
+                conn.rollback()
+                raise
+
+    def release_foreground_claims(self) -> None:
+        if self._conn is None:
+            return
+        with self._lock:
+            try:
+                self._conn.execute(
+                    "DELETE FROM foreground_compaction_claims WHERE owner_id = ?",
+                    (self._owner_id,),
+                )
+                self._conn.commit()
+            except sqlite3.Error:
+                self._conn.rollback()
+
+    def capture_snapshot(
+        self,
+        trigger: _BackgroundTrigger | None = None,
+    ) -> _BackgroundSnapshot | None:
         """Capture small immutable runtime state and a durable message upper bound."""
         state_lock = getattr(self._engine, "_async_state_lock", None)
         lock = state_lock if state_lock is not None else threading.Lock()
@@ -352,6 +497,11 @@ class AsyncCompactionManager:
             config = copy.deepcopy(self._engine._config)
             session_id = str(getattr(self._engine, "_session_id", "") or "")
             conversation_id = str(getattr(self._engine, "_conversation_id", "") or "")
+            if trigger is not None and (
+                session_id != trigger.session_id
+                or conversation_id != trigger.conversation_id
+            ):
+                return None
             model = str(getattr(self._engine, "model", "") or "")
             provider = str(getattr(self._engine, "provider", "") or "")
             base_url = str(getattr(self._engine, "base_url", "") or "")
@@ -856,21 +1006,25 @@ class AsyncCompactionManager:
             prepared_rows: list[dict[str, Any]] = []
             summary_circuit_breaker = SummaryCircuitBreaker(
                 failure_threshold=int(
-                    getattr(snapshot.config, "summary_circuit_breaker_failure_threshold", 2)
-                    or 2
+                    self._setting(
+                        snapshot.config, "summary_circuit_breaker_failure_threshold", 2
+                    )
                 ),
                 cooldown_seconds=int(
-                    getattr(snapshot.config, "summary_circuit_breaker_cooldown_seconds", 300)
-                    or 300
+                    self._setting(
+                        snapshot.config, "summary_circuit_breaker_cooldown_seconds", 300
+                    )
                 ),
             )
             summary_spend_guard = SummarySpendGuard(
-                max_calls=int(getattr(snapshot.config, "summary_spend_max_calls", 24) or 24),
+                max_calls=int(
+                    self._setting(snapshot.config, "summary_spend_max_calls", 24)
+                ),
                 window_seconds=float(
-                    getattr(snapshot.config, "summary_spend_window_seconds", 600.0) or 600.0
+                    self._setting(snapshot.config, "summary_spend_window_seconds", 600.0)
                 ),
                 backoff_seconds=float(
-                    getattr(snapshot.config, "summary_spend_backoff_seconds", 1800.0) or 1800.0
+                    self._setting(snapshot.config, "summary_spend_backoff_seconds", 1800.0)
                 ),
             )
             try:
@@ -891,6 +1045,8 @@ class AsyncCompactionManager:
                         _circuit_breaker_override=summary_circuit_breaker,
                         _spend_guard_override=summary_spend_guard,
                     )
+                    if self._closed:
+                        return None
                     if not summary_text or not summarized_chunk:
                         raise RuntimeError("background summary returned no content")
                     chunk_ids = [int(row["store_id"]) for row in chunk]
@@ -1009,31 +1165,51 @@ class AsyncCompactionManager:
         conn.commit()
         return cur.rowcount == 1
 
+    def enqueue_trigger(self, session_id: str, conversation_id: str) -> bool:
+        if self._closed or self._worker is None or not session_id or not conversation_id:
+            return False
+        trigger = _BackgroundTrigger(session_id, conversation_id)
+        accepted = self._worker.enqueue(trigger)
+        if accepted:
+            self._enqueued_jobs += 1
+        else:
+            self._dropped_jobs += 1
+        return accepted
+
     def enqueue(self, messages: List[Dict[str, Any]] | None = None) -> bool:
-        if self._closed:
-            return False
-        snapshot = self.capture_snapshot()
-        config = snapshot.config
-        if not (
-            bool(getattr(config, "async_background_compaction_enabled", False))
-            and bool(getattr(config, "async_background_compaction_worker_enabled", False))
-        ):
-            return False
+        """Compatibility wrapper that enqueues only the current identity."""
+        return self.enqueue_trigger(
+            str(getattr(self._engine, "_session_id", "") or ""),
+            str(getattr(self._engine, "_conversation_id", "") or ""),
+        )
+
+    def _run_trigger(self, trigger: _BackgroundTrigger) -> None:
+        try:
+            snapshot = self.capture_snapshot(trigger)
+            if snapshot is None:
+                return
+            self._run_snapshot(snapshot)
+        finally:
+            self._close_connection_after_worker()
+
+    def _close_connection_after_worker(self) -> None:
+        """Release a deferred close once no worker callback can use SQLite."""
+        if not self._closed:
+            return
         with self._lock:
-            if self._worker is None:
-                self._worker = _BoundedBackgroundWorker(
-                    self._run_snapshot,
-                    max_items=max(
-                        1,
-                        int(getattr(config, "async_background_compaction_max_batches", 2) or 2),
-                    ),
+            conn = self._conn
+            if conn is None:
+                return
+            try:
+                conn.execute(
+                    "DELETE FROM foreground_compaction_claims WHERE owner_id = ?",
+                    (self._owner_id,),
                 )
-            accepted = self._worker.enqueue(snapshot)
-            if accepted:
-                self._enqueued_jobs += 1
-            else:
-                self._dropped_jobs += 1
-            return accepted
+                conn.commit()
+            except sqlite3.Error:
+                conn.rollback()
+            conn.close()
+            self._conn = None
 
     def _run_snapshot(self, snapshot: _BackgroundSnapshot) -> None:
         try:
@@ -1115,6 +1291,20 @@ class AsyncCompactionManager:
                 source_ids = list(batch.source_ids)
                 if not source_ids or source_ids != sorted(source_ids):
                     return self._reject_in_transaction(batch, "source_coverage_mismatch")
+                foreground_claim = conn.execute(
+                    """
+                    SELECT 1
+                    FROM foreground_compaction_claims
+                    WHERE conversation_id = ? AND session_id = ?
+                      AND owner_id != ? AND lease_expires_at > ?
+                    LIMIT 1
+                    """,
+                    (conversation_id, session_id, self._owner_id, time.time()),
+                ).fetchone()
+                if foreground_claim:
+                    return self._reject_in_transaction(
+                        batch, "foreground_compaction_in_progress"
+                    )
                 placeholders = ",".join("?" for _ in source_ids)
                 source_rows = conn.execute(
                     f"""
@@ -1293,22 +1483,51 @@ class AsyncCompactionManager:
                     int(row["store_id"]): self._message_from_row(row)
                     for row in source_rows
                 }
-                # Keep post-publish maintenance on the same engine/storage
-                # binding that produced the canonical rows. A concurrent
-                # session rebind waits on this manager lock, so it cannot make
-                # these hooks consult a different DAG or message store.
-                for node in published_nodes:
-                    try:
-                        self._engine._invalidate_rollups_for_published_node(node)
-                    except Exception:
-                        logger.warning("LCM async rollup invalidation failed after publication", exc_info=True)
-                    try:
-                        self._engine._maybe_gc_compacted_tool_results(
-                            [source_by_id[source_id] for source_id in node.source_ids if source_id in source_by_id],
-                            list(node.source_ids),
+                maintenance_dag = None
+                maintenance_store = None
+                try:
+                    if bool(getattr(snapshot.config, "temporal_rollups_enabled", False)):
+                        maintenance_dag = (
+                            self._engine._dag
+                            if self._db_path == ":memory:"
+                            else SummaryDAG(self._db_path)
                         )
-                    except Exception:
-                        logger.warning("LCM async transcript maintenance failed after publication", exc_info=True)
+                    if bool(getattr(snapshot.config, "large_output_transcript_gc_enabled", False)):
+                        maintenance_store = (
+                            self._engine._store
+                            if self._db_path == ":memory:"
+                            else MessageStore(
+                                self._db_path,
+                                ingest_protection_config=snapshot.config,
+                                hermes_home=snapshot.hermes_home,
+                            )
+                        )
+                    for node in published_nodes:
+                        try:
+                            self._engine._invalidate_rollups_for_published_node(
+                                node,
+                                config=snapshot.config,
+                                dag=maintenance_dag,
+                                session_id=batch.session_id,
+                            )
+                        except Exception:
+                            logger.warning("LCM async rollup invalidation failed after publication", exc_info=True)
+                        try:
+                            self._engine._maybe_gc_compacted_tool_results(
+                                [source_by_id[source_id] for source_id in node.source_ids if source_id in source_by_id],
+                                list(node.source_ids),
+                                config=snapshot.config,
+                                session_id=batch.session_id,
+                                hermes_home=snapshot.hermes_home,
+                                store=maintenance_store,
+                            )
+                        except Exception:
+                            logger.warning("LCM async transcript maintenance failed after publication", exc_info=True)
+                finally:
+                    if maintenance_store is not None and maintenance_store is not self._engine._store:
+                        maintenance_store.close()
+                    if maintenance_dag is not None and maintenance_dag is not self._engine._dag:
+                        maintenance_dag.close()
                 promotion_result = PromotionResult(
                     True,
                     "promoted",
@@ -1484,15 +1703,19 @@ class AsyncCompactionManager:
         worker = self._worker
         if worker is not None:
             # A live daemon callback still owns this manager connection. Wait
-            # for it rather than closing SQLite underneath the worker. A caller
-            # that needs a bounded wait can use drain(timeout) before shutdown.
-            if not worker.close(timeout=None):
+            # only for a bounded interval; the worker closes the connection from
+            # its own completion path if it outlives this call.
+            if not worker.close(timeout=_WORKER_CLOSE_TIMEOUT_SECONDS):
                 logger.warning("LCM async compaction worker did not stop before shutdown")
                 return
         with self._lock:
             conn = self._conn
             if conn is not None:
                 try:
+                    conn.execute(
+                        "DELETE FROM foreground_compaction_claims WHERE owner_id = ?",
+                        (self._owner_id,),
+                    )
                     owned_rows = conn.execute(
                         """
                         SELECT batch_id FROM compaction_batches
