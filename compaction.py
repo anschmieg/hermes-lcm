@@ -820,6 +820,7 @@ class CompactionMixin:
                 for message in selected_raw_chunk
                 if id(message) in selected_source_map
             ]
+            expected_source_identity_hashes_by_id: dict[int, str] = {}
             if async_manager is not None and source_ids and summary_input_chunk:
                 if getattr(self._thread_context, "foreground_claim_manager", None) is None:
                     if not async_manager.claim_foreground_sources(
@@ -840,6 +841,24 @@ class CompactionMixin:
                     self._thread_context.foreground_claim_token = (
                         async_manager.foreground_claim_token()
                     )
+                expected_source_identity_hashes_by_id = (
+                    async_manager.capture_foreground_source_identity_hashes(
+                        conversation_id=(
+                            binding.conversation_id if binding is not None else self._conversation_id
+                        ),
+                        session_id=(
+                            binding.session_id if binding is not None else self._session_id
+                        ),
+                        source_ids=source_ids,
+                    )
+                    or {}
+                )
+                if len(expected_source_identity_hashes_by_id) != len(
+                    set(source_ids)
+                ):
+                    self._last_compression_status = "noop"
+                    self._last_compression_noop_reason = "foreground source identity unavailable"
+                    return messages
             if not summary_input_chunk:
                 compacted_chunk = selected_raw_chunk
                 source_tokens = count_messages_tokens(selected_raw_chunk)
@@ -993,6 +1012,10 @@ class CompactionMixin:
                     frontier_store_id=max(consumed_store_ids) if consumed_store_ids else 0,
                     expected_generation=binding.generation,
                     config=binding.config,
+                    expected_source_identity_hashes=[
+                        expected_source_identity_hashes_by_id[source_id]
+                        for source_id in source_store_ids
+                    ],
                 )
             else:
                 self._dag.add_node(node)
@@ -1014,13 +1037,16 @@ class CompactionMixin:
                 hermes_home=binding.hermes_home if binding is not None else None,
                 store=binding.store if binding is not None else None,
             )
-            self._last_compacted_store_id = max(consumed_store_ids) if consumed_store_ids else 0
             if binding is None:
+                self._last_compacted_store_id = max(consumed_store_ids) if consumed_store_ids else 0
                 self._persist_frontier_marker()
-            if binding is not None and not self._foreground_binding_is_current(binding):
-                self._last_compression_status = "noop"
-                self._last_compression_noop_reason = "foreground compaction binding changed"
-                return messages
+            else:
+                with self._async_state_lock:
+                    if not self._foreground_binding_is_current(binding):
+                        return messages
+                    self._last_compacted_store_id = (
+                        max(consumed_store_ids) if consumed_store_ids else 0
+                    )
 
             pressure_remaining_messages = pressure_messages[leading_anchor_count + selected_raw_len:]
             working_messages = working_messages[:leading_anchor_count] + remaining_messages

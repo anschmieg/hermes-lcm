@@ -1367,6 +1367,299 @@ def test_storage_rebind_is_bounded_with_hung_summarizer(tmp_path, monkeypatch):
         engine.shutdown()
 
 
+def test_worker_capture_snapshot_survives_rebind_while_foreground_finishes(
+    tmp_path, monkeypatch
+):
+    """A starting worker keeps the retired manager connection alive."""
+    for iteration in range(20):
+        home_a = tmp_path / f"worker-lifecycle-a-{iteration}"
+        home_b = tmp_path / f"worker-lifecycle-b-{iteration}"
+        config = LCMConfig(
+            database_path="",
+            fresh_tail_count=2,
+            leaf_chunk_tokens=20,
+            async_background_compaction_enabled=True,
+            async_background_compaction_worker_enabled=True,
+        )
+        engine = LCMEngine(config=config, hermes_home=str(home_a))
+        engine.on_session_start(
+            "lifecycle-old",
+            conversation_id="lifecycle-old-conversation",
+            hermes_home=str(home_a),
+            context_length=1_000,
+        )
+        messages = _messages(prefix=f"lifecycle-{iteration}")
+        engine.ingest(messages)
+        old_manager = engine._async_compaction
+        assert old_manager is not None
+        snapshot_entered = Event()
+        allow_snapshot = Event()
+        capture_errors = []
+        original_capture = old_manager.capture_snapshot
+
+        def delayed_capture(*args, **kwargs):
+            snapshot_entered.set()
+            assert allow_snapshot.wait(3.0)
+            try:
+                return original_capture(*args, **kwargs)
+            except BaseException as exc:  # pragma: no cover - red-path evidence
+                capture_errors.append(exc)
+                raise
+
+        monkeypatch.setattr(old_manager, "capture_snapshot", delayed_capture)
+        provider_started = Event()
+        allow_provider = Event()
+
+        def blocked_summary(**kwargs):
+            provider_started.set()
+            assert allow_provider.wait(3.0)
+            return "foreground lifecycle summary", 0
+
+        monkeypatch.setattr("hermes_lcm.engine.summarize_with_escalation", blocked_summary)
+        foreground_result = []
+        foreground = Thread(
+            target=lambda: foreground_result.append(
+                engine.compress(messages, current_tokens=engine.threshold_tokens + 1)
+            )
+        )
+        foreground.start()
+        assert provider_started.wait(2.0)
+        assert engine.on_turn_complete(messages) is True
+        assert snapshot_entered.wait(2.0)
+
+        rebound = Event()
+        rebind = Thread(
+            target=lambda: (
+                engine.on_session_start(
+                    "lifecycle-old",
+                    conversation_id="lifecycle-old-conversation",
+                    hermes_home=str(home_b),
+                    context_length=1_000,
+                ),
+                rebound.set(),
+            )
+        )
+        rebind.start()
+        try:
+            assert rebound.wait(1.0)
+            allow_provider.set()
+            foreground.join(3.0)
+            assert not foreground.is_alive()
+            allow_snapshot.set()
+            assert old_manager.drain(timeout=3.0)
+            assert not capture_errors
+            assert foreground_result == [messages]
+        finally:
+            allow_provider.set()
+            allow_snapshot.set()
+            rebind.join(3.0)
+            foreground.join(3.0)
+            old_manager.drain(timeout=3.0)
+            engine.shutdown()
+
+
+@pytest.mark.parametrize("worker_stage", ("queued", "dequeued", "active"))
+def test_manager_close_defers_connection_for_every_worker_stage(tmp_path, worker_stage):
+    """A bounded close cannot invalidate queued or in-flight worker state."""
+    config = LCMConfig(
+        database_path=str(tmp_path / f"worker-stage-{worker_stage}.db"),
+        async_background_compaction_enabled=True,
+        async_background_compaction_worker_enabled=True,
+    )
+    engine = LCMEngine(config=config)
+    engine.on_session_start(
+        "worker-stage-session",
+        conversation_id="worker-stage-conversation",
+        context_length=1_000,
+    )
+    manager = engine._async_compaction
+    assert manager is not None and manager._worker is not None
+    worker = manager._worker
+    connection = manager.connection
+    release = Event()
+    entered = Event()
+
+    def callback(_item):
+        entered.set()
+        if worker_stage in {"active", "queued"}:
+            assert release.wait(3.0)
+
+    worker._callback = callback
+    if worker_stage == "dequeued":
+        def controlled_get(*args, **kwargs):
+            item = Queue.get(worker._queue, *args, **kwargs)
+            entered.set()
+            assert release.wait(3.0)
+            return item
+
+        worker._queue.get = controlled_get
+        worker._queue.get_nowait = controlled_get
+
+    try:
+        assert worker.enqueue("first")
+        assert entered.wait(2.0)
+        if worker_stage == "queued":
+            assert worker.enqueue("second")
+        manager.close()
+        assert connection is not None
+        assert manager.connection is connection
+    finally:
+        release.set()
+        assert worker.close(timeout=3.0)
+        manager.close()
+        assert manager.connection is None
+        engine.shutdown()
+
+
+def test_foreground_publish_rejects_rewritten_source_inside_publish_fence(
+    tmp_path, monkeypatch
+):
+    """A source rewrite during the provider call invalidates the old result."""
+    for iteration in range(20):
+        db_path = tmp_path / f"foreground-source-fence-{iteration}.db"
+        config = LCMConfig(
+            database_path=str(db_path),
+            fresh_tail_count=2,
+            leaf_chunk_tokens=20,
+            context_threshold=0.10,
+            async_background_compaction_enabled=True,
+            async_background_compaction_worker_enabled=False,
+        )
+        engine_a = LCMEngine(config=config)
+        engine_b = LCMEngine(config=config)
+        engine_a.on_session_start(
+            "source-fence-session",
+            conversation_id="source-fence-conversation",
+            context_length=1_000,
+        )
+        engine_b.on_session_start(
+            "source-fence-session",
+            conversation_id="source-fence-conversation",
+            context_length=1_000,
+        )
+        messages = _messages(prefix=f"source-fence-{iteration}")
+        engine_a.ingest(messages)
+        started = Event()
+        release = Event()
+
+        def blocked_summary(**kwargs):
+            started.set()
+            assert release.wait(3.0)
+            return "stale source summary", 0
+
+        monkeypatch.setattr("hermes_lcm.engine.summarize_with_escalation", blocked_summary)
+        result = []
+        worker = Thread(
+            target=lambda: result.append(
+                engine_a.compress(messages, current_tokens=engine_a.threshold_tokens + 1)
+            )
+        )
+        worker.start()
+        try:
+            assert started.wait(2.0)
+            source_id = int(
+                engine_a._async_compaction.connection.execute(
+                    "SELECT store_id FROM messages WHERE session_id = ? AND role != 'system' "
+                    "ORDER BY store_id LIMIT 1",
+                    ("source-fence-session",),
+                ).fetchone()[0]
+            )
+            engine_b._store._conn.execute(
+                "UPDATE messages SET content = content || ' rewritten by manager b' "
+                "WHERE store_id = ?",
+                (source_id,),
+            )
+            engine_b._store._conn.commit()
+            release.set()
+            worker.join(3.0)
+            assert not worker.is_alive()
+            assert engine_a._dag.get_session_nodes("source-fence-session") == []
+        finally:
+            release.set()
+            worker.join(3.0)
+            engine_b.shutdown()
+            engine_a.shutdown()
+
+
+def test_foreground_marker_does_not_cross_profile_rebind_after_publish(
+    tmp_path, monkeypatch
+):
+    """A published old-profile result cannot advance the new profile marker."""
+    for iteration in range(20):
+        home_a = tmp_path / f"marker-old-{iteration}"
+        home_b = tmp_path / f"marker-new-{iteration}"
+        config = LCMConfig(
+            database_path="",
+            fresh_tail_count=2,
+            leaf_chunk_tokens=20,
+            context_threshold=0.10,
+            async_background_compaction_enabled=False,
+        )
+        engine = LCMEngine(config=config, hermes_home=str(home_a))
+        engine.on_session_start(
+            "marker-old-session",
+            conversation_id="marker-old-conversation",
+            hermes_home=str(home_a),
+            context_length=1_000,
+        )
+        messages = _messages(prefix=f"marker-{iteration}")
+        engine.ingest(messages)
+        published = Event()
+        rebound = Event()
+
+        def rebind_after_publish(*args, **kwargs):
+            published.set()
+            assert rebound.wait(3.0)
+
+        monkeypatch.setattr(engine, "_invalidate_rollups_for_published_node", rebind_after_publish)
+
+        def rebind():
+            assert published.wait(3.0)
+            engine.on_session_start(
+                "marker-new-session",
+                conversation_id="marker-new-conversation",
+                hermes_home=str(home_b),
+                context_length=1_000,
+            )
+            rebound.set()
+
+        rebind_thread = Thread(target=rebind)
+        rebind_thread.start()
+        try:
+            result = engine.compress(messages, current_tokens=engine.threshold_tokens + 1)
+            rebind_thread.join(3.0)
+            assert not rebind_thread.is_alive()
+            assert result == messages
+            assert engine._last_compacted_store_id == 0
+            new_message = {"role": "user", "content": f"new profile message {iteration}"}
+            new_store_id = engine._store.append(
+                "marker-new-session",
+                new_message,
+                token_estimate=8,
+                source="test",
+                conversation_id="marker-new-conversation",
+            )
+            assert engine._get_store_id_map_for_messages([new_message]) == {id(new_message): new_store_id}
+            old_conn = sqlite3.connect(str(home_a / "lcm.db"))
+            new_conn = sqlite3.connect(str(home_b / "lcm.db"))
+            try:
+                assert old_conn.execute(
+                    "SELECT COUNT(*) FROM summary_nodes WHERE session_id = ?",
+                    ("marker-old-session",),
+                ).fetchone()[0] == 1
+                assert new_conn.execute(
+                    "SELECT COUNT(*) FROM summary_nodes WHERE session_id = ?",
+                    ("marker-new-session",),
+                ).fetchone()[0] == 0
+            finally:
+                old_conn.close()
+                new_conn.close()
+        finally:
+            rebound.set()
+            rebind_thread.join(3.0)
+            engine.shutdown()
+
+
 def test_failed_preparation_rolls_back_pending_rows(tmp_path):
     """Failure cleanup is one transaction and preserves data when cleanup fails."""
     engine = _engine(tmp_path, session_id="failure-rollback")

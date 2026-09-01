@@ -254,6 +254,7 @@ class AsyncCompactionManager:
         self._closed = False
         self._close_requested = False
         self._foreground_inflight = 0
+        self._worker_inflight = 0
         self._foreground_claim = threading.local()
 
     @property
@@ -526,6 +527,46 @@ class AsyncCompactionManager:
         claim = getattr(self._foreground_claim, "value", None)
         return int(claim[2]) if claim is not None else None
 
+    def capture_foreground_source_identity_hashes(
+        self,
+        *,
+        conversation_id: str,
+        session_id: str,
+        source_ids: list[int],
+    ) -> dict[int, str] | None:
+        """Capture source identities that publication must still match."""
+        if self._closed or self._conn is None or not source_ids:
+            return None
+        source_ids = sorted(dict.fromkeys(int(value) for value in source_ids))
+        placeholders = ",".join("?" for _ in source_ids)
+        with self._lock:
+            conn = self._conn
+            if conn is None:
+                return None
+            rows = conn.execute(
+                f"""
+                SELECT * FROM messages
+                WHERE store_id IN ({placeholders})
+                ORDER BY store_id
+                """,
+                source_ids,
+            ).fetchall()
+            if [int(row["store_id"]) for row in rows] != source_ids:
+                return None
+            if any(
+                str(row["session_id"] or "") != session_id
+                or (
+                    str(row["conversation_id"] or "")
+                    and str(row["conversation_id"] or "") != conversation_id
+                )
+                for row in rows
+            ):
+                return None
+            return {
+                int(row["store_id"]): self._source_identity_hash(row)
+                for row in rows
+            }
+
     def release_foreground_claims(self, claim_token: int | None = None) -> None:
         if self._conn is None:
             return
@@ -585,6 +626,20 @@ class AsyncCompactionManager:
             self._foreground_inflight = max(0, self._foreground_inflight - 1)
             self._finish_close_locked()
 
+    def _begin_worker_operation(self) -> bool:
+        """Reserve this manager before a worker callback can read SQLite."""
+        with self._lock:
+            if self._conn is None:
+                return False
+            self._worker_inflight += 1
+            return True
+
+    def _end_worker_operation(self) -> None:
+        """Release the worker's connection lease after its final SQLite read."""
+        with self._lock:
+            self._worker_inflight = max(0, self._worker_inflight - 1)
+            self._finish_close_locked(completed_worker=True)
+
     def publish_foreground_node(
         self,
         node: SummaryNode,
@@ -595,6 +650,7 @@ class AsyncCompactionManager:
         frontier_store_id: int = 0,
         expected_generation: int | None = None,
         config: Any | None = None,
+        expected_source_identity_hashes: list[str] | None = None,
     ) -> bool:
         """Publish one foreground node only while its SQLite fence is valid."""
         if self._closed or self._conn is None or claim_token is None:
@@ -657,6 +713,39 @@ class AsyncCompactionManager:
                 if renewed.rowcount != 1:
                     conn.rollback()
                     return False
+
+                if node.source_type == "messages":
+                    if expected_source_identity_hashes is None or len(
+                        expected_source_identity_hashes
+                    ) != len(source_ids):
+                        conn.rollback()
+                        return False
+                    source_rows = conn.execute(
+                        f"""
+                        SELECT * FROM messages
+                        WHERE store_id IN ({placeholders})
+                        ORDER BY store_id
+                        """,
+                        source_ids,
+                    ).fetchall()
+                    if [int(row["store_id"]) for row in source_rows] != source_ids:
+                        conn.rollback()
+                        return False
+                    if any(
+                        str(row["session_id"] or "") != session_id
+                        or (
+                            str(row["conversation_id"] or "")
+                            and str(row["conversation_id"] or "") != conversation_id
+                        )
+                        for row in source_rows
+                    ):
+                        conn.rollback()
+                        return False
+                    if [
+                        self._source_identity_hash(row) for row in source_rows
+                    ] != [str(value) for value in expected_source_identity_hashes]:
+                        conn.rollback()
+                        return False
 
                 overlap = conn.execute(
                     f"""
@@ -1412,24 +1501,28 @@ class AsyncCompactionManager:
         )
 
     def _run_trigger(self, trigger: _BackgroundTrigger) -> None:
+        if not self._begin_worker_operation():
+            return
         try:
             snapshot = self.capture_snapshot(trigger)
             if snapshot is None:
                 return
             self._run_snapshot(snapshot)
         finally:
-            self._close_connection_after_worker()
+            self._end_worker_operation()
 
-    def _close_connection_after_worker(self) -> None:
-        """Release a deferred close once no worker callback can use SQLite."""
-        if not self._closed:
-            return
-        with self._lock:
-            self._finish_close_locked()
-
-    def _finish_close_locked(self) -> None:
+    def _finish_close_locked(self, *, completed_worker: bool = False) -> None:
         """Close only after workers and foreground operations release the manager."""
-        if not self._close_requested or self._foreground_inflight:
+        if (
+            not self._close_requested
+            or self._foreground_inflight
+            or self._worker_inflight
+        ):
+            return
+        worker = self._worker
+        if not completed_worker and worker is not None and (
+            worker.active or worker.queue_depth
+        ):
             return
         conn = self._conn
         if conn is None:
@@ -1967,6 +2060,10 @@ class AsyncCompactionManager:
     def close(self) -> None:
         if self._closed and not self._close_requested:
             return
+        # Do not take the manager lock here: preparation may hold it across a
+        # provider call, and shutdown must remain bounded while that call is
+        # still live. The worker/foreground guards below reconcile the close
+        # request once the current operation releases the connection.
         self._closed = True
         self._close_requested = True
         worker = self._worker
