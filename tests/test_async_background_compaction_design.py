@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
 import time
 from queue import Queue
 from pathlib import Path
@@ -1585,6 +1586,10 @@ def test_foreground_marker_does_not_cross_profile_rebind_after_publish(
     tmp_path, monkeypatch
 ):
     """A published old-profile result cannot advance the new profile marker."""
+    monkeypatch.setattr(
+        "hermes_lcm.engine.summarize_with_escalation",
+        lambda **kwargs: ("marker rebind summary", 0),
+    )
     for iteration in range(20):
         home_a = tmp_path / f"marker-old-{iteration}"
         home_b = tmp_path / f"marker-new-{iteration}"
@@ -1943,3 +1948,184 @@ def test_promotion_does_not_acquire_engine_state_lock_under_manager_lock(tmp_pat
         assert result.promoted is True
     finally:
         engine.shutdown()
+
+
+def test_same_identity_rebind_during_blocked_post_publish_maintenance_is_bounded(
+    tmp_path, monkeypatch
+):
+    """A profile rebind with the same session identity cannot deadlock promotion."""
+    monkeypatch.setattr(
+        "hermes_lcm.engine.summarize_with_escalation",
+        lambda **kwargs: ("same-identity maintenance summary", 0),
+    )
+    leaked_threads = []
+    for iteration in range(50):
+        home_a = tmp_path / f"maintenance-lock-a-{iteration}"
+        home_b = tmp_path / f"maintenance-lock-b-{iteration}"
+        config = LCMConfig(
+            database_path="",
+            fresh_tail_count=2,
+            leaf_chunk_tokens=20,
+            async_background_compaction_enabled=True,
+            temporal_rollups_enabled=True,
+            large_output_transcript_gc_enabled=True,
+        )
+        engine = LCMEngine(config=config, hermes_home=str(home_a))
+        maintenance_started = Event()
+        rebind_returned = Event()
+        allow_maintenance = Event()
+        promotion_result = []
+        errors = []
+
+        def blocked_rollup(node, **kwargs):
+            maintenance_started.set()
+            if not rebind_returned.wait(1.0):
+                errors.append(RuntimeError("same-identity rebind did not return"))
+            if not allow_maintenance.wait(1.0):
+                errors.append(RuntimeError("maintenance was not released"))
+
+        monkeypatch.setattr(engine, "_invalidate_rollups_for_published_node", blocked_rollup)
+        try:
+            session_id = "same-identity-session"
+            conversation_id = "same-identity-conversation"
+            engine.on_session_start(
+                session_id,
+                conversation_id=conversation_id,
+                hermes_home=str(home_a),
+                context_length=1_000,
+            )
+            messages = _messages(prefix=f"same-identity-{iteration}")
+            engine.ingest(messages)
+            batch = engine.prepare_background_compaction_once(messages)
+
+            promotion = Thread(
+                target=lambda: promotion_result.append(
+                    engine.promote_prepared_compaction(batch.batch_id, messages)
+                ),
+                name=f"lcm-test-promotion-{iteration}",
+            )
+            rebind = Thread(
+                target=lambda: (
+                    engine.on_session_start(
+                        session_id,
+                        conversation_id=conversation_id,
+                        hermes_home=str(home_b),
+                        context_length=1_000,
+                    ),
+                    rebind_returned.set(),
+                ),
+                name=f"lcm-test-rebind-{iteration}",
+            )
+            promotion.start()
+            assert maintenance_started.wait(1.0)
+            rebind.start()
+            rebind.join(1.0)
+            allow_maintenance.set()
+            promotion.join(1.0)
+            rebind.join(1.0)
+            # Break the expected red-path cycle so this repro never leaves
+            # non-daemon test threads behind after documenting the failure.
+            if promotion.is_alive() or rebind.is_alive():
+                rebind_returned.set()
+                allow_maintenance.set()
+                promotion.join(1.0)
+                rebind.join(1.0)
+            assert not promotion.is_alive()
+            assert not rebind.is_alive()
+            assert not errors
+            assert promotion_result and promotion_result[0].promoted is True
+            assert engine._last_compacted_store_id == 0
+        finally:
+            allow_maintenance.set()
+            leaked_threads.extend(
+                thread
+                for thread in threading.enumerate()
+                if thread.name in {
+                    f"lcm-test-promotion-{iteration}",
+                    f"lcm-test-rebind-{iteration}",
+                }
+                and thread.is_alive()
+            )
+            engine.shutdown()
+
+    assert not leaked_threads
+
+
+def test_status_close_race_is_coherent_and_does_not_use_closed_connection(
+    tmp_path,
+):
+    """Status and close share a safe connection lifetime under repeated races."""
+
+    class ConnectionProxy:
+        def __init__(self, connection, status_thread_id):
+            self._connection = connection
+            self._status_thread_id = status_thread_id
+            self.query_started = Event()
+            self.allow_query = Event()
+            self._blocked = False
+
+        def execute(self, sql, *args):
+            if (
+                threading.get_ident() == self._status_thread_id
+                and not self._blocked
+                and str(sql).lstrip().upper().startswith("SELECT STATE")
+            ):
+                self._blocked = True
+                self.query_started.set()
+                assert self.allow_query.wait(1.0)
+            return self._connection.execute(sql, *args)
+
+        def __getattr__(self, name):
+            return getattr(self._connection, name)
+
+    for iteration in range(100):
+        config = LCMConfig(
+            database_path=str(tmp_path / f"status-close-{iteration}.db"),
+            async_background_compaction_enabled=True,
+        )
+        engine = LCMEngine(config=config)
+        manager = engine._async_compaction
+        assert manager is not None
+        original_connection = manager.connection
+        assert original_connection is not None
+        status_errors = []
+        status_values = []
+        close_returned = Event()
+        status_thread_id = [None]
+        proxy = ConnectionProxy(original_connection, None)
+        manager._conn = proxy
+
+        def run_status():
+            status_thread_id[0] = threading.get_ident()
+            proxy._status_thread_id = status_thread_id[0]
+            try:
+                status_values.append(manager.status())
+            except BaseException as exc:  # pragma: no cover - red-path evidence
+                status_errors.append(exc)
+
+        status = Thread(target=run_status, name=f"lcm-test-status-{iteration}")
+        closer = Thread(
+            target=lambda: (manager.close(), close_returned.set()),
+            name=f"lcm-test-close-{iteration}",
+        )
+        try:
+            status.start()
+            assert proxy.query_started.wait(1.0)
+            closer.start()
+            # The unfixed status path lets close invalidate the connection while
+            # the first query is paused. A lock-protected path keeps close behind
+            # this query, so release it after giving the old path a chance to race.
+            close_returned.wait(0.05)
+            proxy.allow_query.set()
+            status.join(1.0)
+            closer.join(1.0)
+            assert not status.is_alive()
+            assert not closer.is_alive()
+            assert not status_errors
+            assert status_values
+            assert status_values[0]["pending_batches"] >= 0
+        finally:
+            proxy.allow_query.set()
+            status.join(1.0)
+            closer.join(1.0)
+            engine.shutdown()

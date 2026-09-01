@@ -19,7 +19,8 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List
+from types import MappingProxyType
+from typing import Any, Callable, Dict, List, Mapping
 
 from .db_bootstrap import (
     configure_connection,
@@ -92,6 +93,7 @@ class _BackgroundSnapshot:
     session_stateless: bool = False
     threshold_tokens: int = 0
     raw_context_length: int = 0
+    binding_generation: int = 0
 
 
 @dataclass(frozen=True)
@@ -100,6 +102,48 @@ class _BackgroundTrigger:
 
     session_id: str
     conversation_id: str
+
+
+@dataclass(frozen=True)
+class _PublishedNodeMaintenance:
+    """Immutable publication data handed to post-commit maintenance."""
+
+    node_id: int
+    session_id: str
+    depth: int
+    summary: str
+    token_count: int
+    source_token_count: int
+    source_ids: tuple[int, ...]
+    created_at: float
+    earliest_at: float | None
+    latest_at: float | None
+    expand_hint: str
+
+
+@dataclass(frozen=True)
+class _PromotionMaintenancePayload:
+    """Detached, immutable inputs for maintenance after publication."""
+
+    nodes: tuple[_PublishedNodeMaintenance, ...]
+    source_messages: tuple[tuple[int, Mapping[str, Any]], ...]
+    snapshot: _BackgroundSnapshot
+    db_path: str
+    publication_dag: Any = None
+    publication_store: Any = None
+
+
+def _freeze_maintenance_value(value: Any) -> Any:
+    """Copy JSON-like row data into immutable containers for maintenance."""
+    if isinstance(value, dict):
+        return MappingProxyType(
+            {key: _freeze_maintenance_value(item) for key, item in value.items()}
+        )
+    if isinstance(value, list):
+        return tuple(_freeze_maintenance_value(item) for item in value)
+    if isinstance(value, set):
+        return frozenset(_freeze_maintenance_value(item) for item in value)
+    return value
 
 
 class _BoundedBackgroundWorker:
@@ -828,6 +872,7 @@ class AsyncCompactionManager:
             session_stateless = bool(getattr(self._engine, "_session_stateless", False))
             threshold_tokens = int(getattr(self._engine, "threshold_tokens", 0) or 0)
             raw_context_length = int(getattr(self._engine, "raw_context_length", 0) or 0)
+            binding_generation = int(getattr(self._engine, "_binding_generation", 0) or 0)
             with self._lock:
                 conn = self._conn
                 assert conn is not None
@@ -855,6 +900,7 @@ class AsyncCompactionManager:
             session_stateless=session_stateless,
             threshold_tokens=threshold_tokens,
             raw_context_length=raw_context_length,
+            binding_generation=binding_generation,
         )
 
     @classmethod
@@ -1601,6 +1647,104 @@ class AsyncCompactionManager:
             raise
         return PromotionResult(False, reason, batch.batch_id)
 
+    @staticmethod
+    def _maintenance_node(node: SummaryNode) -> _PublishedNodeMaintenance:
+        return _PublishedNodeMaintenance(
+            node_id=int(node.node_id),
+            session_id=str(node.session_id),
+            depth=int(node.depth),
+            summary=str(node.summary),
+            token_count=int(node.token_count),
+            source_token_count=int(node.source_token_count),
+            source_ids=tuple(int(source_id) for source_id in node.source_ids),
+            created_at=float(node.created_at),
+            earliest_at=node.earliest_at,
+            latest_at=node.latest_at,
+            expand_hint=str(node.expand_hint),
+        )
+
+    def _run_post_publication_maintenance(
+        self,
+        payload: _PromotionMaintenancePayload,
+    ) -> None:
+        """Run detached maintenance without holding the manager or state lock."""
+        snapshot = payload.snapshot
+        maintenance_dag = payload.publication_dag
+        maintenance_store = payload.publication_store
+        owns_dag = False
+        owns_store = False
+        if bool(getattr(snapshot.config, "temporal_rollups_enabled", False)):
+            if maintenance_dag is None:
+                maintenance_dag = SummaryDAG(payload.db_path)
+                owns_dag = True
+        if bool(getattr(snapshot.config, "large_output_transcript_gc_enabled", False)):
+            if maintenance_store is None:
+                maintenance_store = MessageStore(
+                    payload.db_path,
+                    ingest_protection_config=snapshot.config,
+                    hermes_home=snapshot.hermes_home,
+                )
+                owns_store = True
+
+        nodes = tuple(
+            SummaryNode(
+                node_id=node.node_id,
+                session_id=node.session_id,
+                depth=node.depth,
+                summary=node.summary,
+                token_count=node.token_count,
+                source_token_count=node.source_token_count,
+                source_ids=list(node.source_ids),
+                source_type="messages",
+                created_at=node.created_at,
+                earliest_at=node.earliest_at,
+                latest_at=node.latest_at,
+                expand_hint=node.expand_hint,
+            )
+            for node in payload.nodes
+        )
+        source_by_id = {
+            source_id: dict(message)
+            for source_id, message in payload.source_messages
+        }
+        try:
+            for node in nodes:
+                try:
+                    self._engine._invalidate_rollups_for_published_node(
+                        node,
+                        config=snapshot.config,
+                        dag=maintenance_dag,
+                        session_id=snapshot.session_id,
+                    )
+                except Exception:
+                    logger.warning(
+                        "LCM async rollup invalidation failed after publication",
+                        exc_info=True,
+                    )
+                try:
+                    self._engine._maybe_gc_compacted_tool_results(
+                        [
+                            source_by_id[source_id]
+                            for source_id in node.source_ids
+                            if source_id in source_by_id
+                        ],
+                        list(node.source_ids),
+                        config=snapshot.config,
+                        session_id=snapshot.session_id,
+                        hermes_home=snapshot.hermes_home,
+                        store=maintenance_store,
+                    )
+                except Exception:
+                    logger.warning(
+                        "LCM async transcript maintenance failed after publication",
+                        exc_info=True,
+                    )
+        finally:
+            if owns_store and maintenance_store is not None:
+                maintenance_store.close()
+            if owns_dag and maintenance_dag is not None:
+                maintenance_dag.close()
+
     def promote(
         self,
         batch_id: str,
@@ -1611,6 +1755,7 @@ class AsyncCompactionManager:
         snapshot = self.capture_snapshot()
         if not bool(getattr(snapshot.config, "async_background_compaction_enabled", False)):
             return PromotionResult(False, "disabled", batch_id)
+        maintenance_payload: _PromotionMaintenancePayload | None = None
         with self._lock:
             conn = self._conn
             assert conn is not None
@@ -1836,55 +1981,24 @@ class AsyncCompactionManager:
                     )
                 conn.execute("DELETE FROM pending_summary_nodes WHERE batch_id = ?", (batch.batch_id,))
                 conn.commit()
-                source_by_id = {
-                    int(row["store_id"]): self._message_from_row(row)
-                    for row in source_rows
-                }
-                maintenance_dag = None
-                maintenance_store = None
-                try:
-                    if bool(getattr(snapshot.config, "temporal_rollups_enabled", False)):
-                        maintenance_dag = (
-                            self._engine._dag
-                            if self._db_path == ":memory:"
-                            else SummaryDAG(self._db_path)
+                maintenance_payload = _PromotionMaintenancePayload(
+                    nodes=tuple(self._maintenance_node(node) for node in published_nodes),
+                    source_messages=tuple(
+                        (
+                            int(row["store_id"]),
+                            _freeze_maintenance_value(self._message_from_row(row)),
                         )
-                    if bool(getattr(snapshot.config, "large_output_transcript_gc_enabled", False)):
-                        maintenance_store = (
-                            self._engine._store
-                            if self._db_path == ":memory:"
-                            else MessageStore(
-                                self._db_path,
-                                ingest_protection_config=snapshot.config,
-                                hermes_home=snapshot.hermes_home,
-                            )
-                        )
-                    for node in published_nodes:
-                        try:
-                            self._engine._invalidate_rollups_for_published_node(
-                                node,
-                                config=snapshot.config,
-                                dag=maintenance_dag,
-                                session_id=batch.session_id,
-                            )
-                        except Exception:
-                            logger.warning("LCM async rollup invalidation failed after publication", exc_info=True)
-                        try:
-                            self._engine._maybe_gc_compacted_tool_results(
-                                [source_by_id[source_id] for source_id in node.source_ids if source_id in source_by_id],
-                                list(node.source_ids),
-                                config=snapshot.config,
-                                session_id=batch.session_id,
-                                hermes_home=snapshot.hermes_home,
-                                store=maintenance_store,
-                            )
-                        except Exception:
-                            logger.warning("LCM async transcript maintenance failed after publication", exc_info=True)
-                finally:
-                    if maintenance_store is not None and maintenance_store is not self._engine._store:
-                        maintenance_store.close()
-                    if maintenance_dag is not None and maintenance_dag is not self._engine._dag:
-                        maintenance_dag.close()
+                        for row in source_rows
+                    ),
+                    snapshot=snapshot,
+                    db_path=self._db_path,
+                    publication_dag=(
+                        self._engine._dag if self._db_path == ":memory:" else None
+                    ),
+                    publication_store=(
+                        self._engine._store if self._db_path == ":memory:" else None
+                    ),
+                )
                 promotion_result = PromotionResult(
                     True,
                     "promoted",
@@ -1896,15 +2010,21 @@ class AsyncCompactionManager:
                 conn.rollback()
                 raise
 
-        # The durable publication transaction is complete before touching the
-        # engine's mutable runtime state. This keeps promotion's lock order
-        # compatible with on_session_start(), which takes the state lock before
-        # rebinding and closing the manager.
+        # The durable publication transaction and immutable maintenance capture
+        # are complete before the manager lock is released. Maintenance never
+        # runs under that lock and therefore cannot invert the state -> manager
+        # order used by snapshot capture and session rebind.
+        if maintenance_payload is not None:
+            self._run_post_publication_maintenance(maintenance_payload)
+
         state_lock = getattr(self._engine, "_async_state_lock", None)
         lock = state_lock if state_lock is not None else threading.Lock()
         with lock:
             if (
-                str(getattr(self._engine, "_session_id", "") or "") == session_id
+                int(getattr(self._engine, "_binding_generation", -1))
+                == snapshot.binding_generation
+                and getattr(self._engine, "_async_compaction", None) is self
+                and str(getattr(self._engine, "_session_id", "") or "") == session_id
                 and str(getattr(self._engine, "_conversation_id", "") or "") == conversation_id
             ):
                 self._engine._last_compacted_store_id = max(
@@ -1964,94 +2084,92 @@ class AsyncCompactionManager:
         return self.promote(str(row[0]), messages)
 
     def status(self, conversation_id: str | None = None) -> Dict[str, Any]:
-        if (
-            self._closed
-            or self._conn is None
-            or not self._background_tables_enabled
-        ):
+        with self._lock:
+            conn = self._conn
+            if self._closed or conn is None or not self._background_tables_enabled:
+                return {
+                    "enabled": self._background_tables_enabled,
+                    "pending_batches": 0,
+                    "prepared_batches": 0,
+                    "promoted_batches": 0,
+                    "rejected_batches": 0,
+                    "failed_batches": 0,
+                    "superseded_batches": 0,
+                    "preparing_batches": 0,
+                    "worker_enabled": False,
+                    "queue_depth": 0,
+                    "worker_active": False,
+                    "enqueued_jobs": 0,
+                    "dropped_jobs": 0,
+                    "pending_summaries": 0,
+                    "oldest_pending_age_seconds": None,
+                    "last_rejected_reason": None,
+                    "last_error": None,
+                }
+            where = ""
+            args: list[Any] = []
+            if conversation_id:
+                where = "WHERE conversation_id = ?"
+                args.append(conversation_id)
+            rows = conn.execute(
+                f"SELECT state, COUNT(*) AS count FROM compaction_batches {where} GROUP BY state",
+                args,
+            ).fetchall()
+            counts = {str(row[0]): int(row[1] or 0) for row in rows}
+            pending_rows = conn.execute(
+                f"""
+                SELECT COUNT(*) AS count, MIN(p.created_at) AS oldest_created_at
+                FROM pending_summary_nodes AS p
+                JOIN compaction_batches AS b ON b.batch_id = p.batch_id
+                WHERE b.state IN ('pending', 'preparing', 'ready')
+                  {"AND p.conversation_id = ?" if conversation_id else ""}
+                """,
+                [conversation_id] if conversation_id else [],
+            ).fetchone()
+            latest_rejected = conn.execute(
+                f"""
+                SELECT rejected_reason
+                FROM compaction_batches
+                {where + (" AND" if where else "WHERE")} state = 'rejected'
+                ORDER BY updated_at DESC LIMIT 1
+                """,
+                [*args],
+            ).fetchone()
+            latest_error = conn.execute(
+                f"""
+                SELECT last_error
+                FROM compaction_batches
+                {where + (" AND" if where else "WHERE")} last_error IS NOT NULL
+                  AND last_error != ''
+                ORDER BY updated_at DESC LIMIT 1
+                """,
+                [*args],
+            ).fetchone()
+            worker = self._worker
+            oldest_created_at = pending_rows[1] if pending_rows else None
             return {
-                "enabled": self._background_tables_enabled,
-                "pending_batches": 0,
-                "prepared_batches": 0,
-                "promoted_batches": 0,
-                "rejected_batches": 0,
-                "failed_batches": 0,
-                "superseded_batches": 0,
-                "preparing_batches": 0,
-                "worker_enabled": False,
-                "queue_depth": 0,
-                "worker_active": False,
-                "enqueued_jobs": 0,
-                "dropped_jobs": 0,
-                "pending_summaries": 0,
-                "oldest_pending_age_seconds": None,
-                "last_rejected_reason": None,
-                "last_error": None,
+                "enabled": bool(getattr(self._engine._config, "async_background_compaction_enabled", False)),
+                "worker_enabled": bool(getattr(self._engine._config, "async_background_compaction_worker_enabled", False)),
+                "pending_batches": counts.get("pending", 0) + counts.get("preparing", 0),
+                "preparing_batches": counts.get("preparing", 0),
+                "prepared_batches": counts.get("ready", 0),
+                "promoted_batches": counts.get("promoted", 0),
+                "rejected_batches": counts.get("rejected", 0),
+                "failed_batches": counts.get("failed", 0),
+                "superseded_batches": counts.get("superseded", 0),
+                "queue_depth": worker.queue_depth if worker else 0,
+                "worker_active": worker.active if worker else False,
+                "enqueued_jobs": self._enqueued_jobs,
+                "dropped_jobs": self._dropped_jobs,
+                "pending_summaries": int(pending_rows[0] or 0) if pending_rows else 0,
+                "oldest_pending_age_seconds": (
+                    max(0.0, time.time() - float(oldest_created_at))
+                    if oldest_created_at is not None
+                    else None
+                ),
+                "last_rejected_reason": str(latest_rejected[0] or "") if latest_rejected else None,
+                "last_error": str(latest_error[0] or "") if latest_error else None,
             }
-        where = ""
-        args: list[Any] = []
-        if conversation_id:
-            where = "WHERE conversation_id = ?"
-            args.append(conversation_id)
-        rows = self._conn.execute(
-            f"SELECT state, COUNT(*) AS count FROM compaction_batches {where} GROUP BY state",
-            args,
-        ).fetchall()
-        counts = {str(row[0]): int(row[1] or 0) for row in rows}
-        pending_rows = self._conn.execute(
-            f"""
-            SELECT COUNT(*) AS count, MIN(p.created_at) AS oldest_created_at
-            FROM pending_summary_nodes AS p
-            JOIN compaction_batches AS b ON b.batch_id = p.batch_id
-            WHERE b.state IN ('pending', 'preparing', 'ready')
-              {"AND p.conversation_id = ?" if conversation_id else ""}
-            """,
-            [conversation_id] if conversation_id else [],
-        ).fetchone()
-        latest_rejected = self._conn.execute(
-            f"""
-            SELECT rejected_reason
-            FROM compaction_batches
-            {where + (" AND" if where else "WHERE")} state = 'rejected'
-            ORDER BY updated_at DESC LIMIT 1
-            """,
-            [*args],
-        ).fetchone()
-        latest_error = self._conn.execute(
-            f"""
-            SELECT last_error
-            FROM compaction_batches
-            {where + (" AND" if where else "WHERE")} last_error IS NOT NULL
-              AND last_error != ''
-            ORDER BY updated_at DESC LIMIT 1
-            """,
-            [*args],
-        ).fetchone()
-        worker = self._worker
-        oldest_created_at = pending_rows[1] if pending_rows else None
-        return {
-            "enabled": bool(getattr(self._engine._config, "async_background_compaction_enabled", False)),
-            "worker_enabled": bool(getattr(self._engine._config, "async_background_compaction_worker_enabled", False)),
-            "pending_batches": counts.get("pending", 0) + counts.get("preparing", 0),
-            "preparing_batches": counts.get("preparing", 0),
-            "prepared_batches": counts.get("ready", 0),
-            "promoted_batches": counts.get("promoted", 0),
-            "rejected_batches": counts.get("rejected", 0),
-            "failed_batches": counts.get("failed", 0),
-            "superseded_batches": counts.get("superseded", 0),
-            "queue_depth": worker.queue_depth if worker else 0,
-            "worker_active": worker.active if worker else False,
-            "enqueued_jobs": self._enqueued_jobs,
-            "dropped_jobs": self._dropped_jobs,
-            "pending_summaries": int(pending_rows[0] or 0) if pending_rows else 0,
-            "oldest_pending_age_seconds": (
-                max(0.0, time.time() - float(oldest_created_at))
-                if oldest_created_at is not None
-                else None
-            ),
-            "last_rejected_reason": str(latest_rejected[0] or "") if latest_rejected else None,
-            "last_error": str(latest_error[0] or "") if latest_error else None,
-        }
 
     def drain(self, timeout: float | None = None) -> bool:
         worker = self._worker
