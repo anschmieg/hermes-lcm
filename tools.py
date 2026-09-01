@@ -6398,6 +6398,17 @@ def lcm_status(args: Dict[str, Any], **kwargs) -> str:
     engine = _require_engine(kwargs)
     if engine is None:
         return json.dumps({"error": "LCM engine not initialized"})
+    with engine._resource_operation(hold_state_lock=True) as binding:
+        if binding is None:
+            return json.dumps({"error": "LCM engine is closed"})
+        return _lcm_status_impl(args, **kwargs)
+
+
+def _lcm_status_impl(args: Dict[str, Any], **kwargs) -> str:
+    """Quick health overview of the LCM engine for the current session."""
+    engine = _require_engine(kwargs)
+    if engine is None:
+        return json.dumps({"error": "LCM engine not initialized"})
 
     # Read the foreground view so a side-channel session that briefly owns
     # engine._session_id (cron tick inside the gateway process, debug probe,

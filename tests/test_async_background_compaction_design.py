@@ -2129,3 +2129,234 @@ def test_status_close_race_is_coherent_and_does_not_use_closed_connection(
             status.join(1.0)
             closer.join(1.0)
             engine.shutdown()
+
+
+def test_foreground_preflight_drops_ready_batch_after_exact_profile_rebind(
+    tmp_path, monkeypatch
+):
+    """A ready batch from a retired profile cannot truncate the new context."""
+    for iteration in range(20):
+        home_a = tmp_path / f"preflight-rebind-a-{iteration}"
+        home_b = tmp_path / f"preflight-rebind-b-{iteration}"
+        config = LCMConfig(
+            database_path="",
+            fresh_tail_count=2,
+            leaf_chunk_tokens=20,
+            context_threshold=0.10,
+            async_background_compaction_enabled=True,
+        )
+        engine = LCMEngine(config=config, hermes_home=str(home_a))
+        session_id = "preflight-rebind-session"
+        conversation_id = "preflight-rebind-conversation"
+        messages = _messages(prefix=f"preflight-rebind-{iteration}")
+        engine.on_session_start(
+            session_id,
+            conversation_id=conversation_id,
+            hermes_home=str(home_a),
+            context_length=1_000,
+        )
+        engine.ingest(messages)
+        batch = engine.prepare_background_compaction_once(messages)
+        assert batch is not None and batch.state == "ready"
+        old_manager = engine._async_compaction
+        assert old_manager is not None
+
+        preflight_started = Event()
+        allow_preflight = Event()
+        old_manager_used = Event()
+        original_get_store_id_map = engine._get_store_id_map_for_messages
+        original_promote_next = old_manager.promote_next
+
+        def blocked_store_id_map(current_messages):
+            preflight_started.set()
+            assert allow_preflight.wait(3.0)
+            return original_get_store_id_map(current_messages)
+
+        def unexpected_promote_next(current_messages):
+            old_manager_used.set()
+            return original_promote_next(current_messages)
+
+        monkeypatch.setattr(engine, "_get_store_id_map_for_messages", blocked_store_id_map)
+        monkeypatch.setattr(old_manager, "promote_next", unexpected_promote_next)
+        engine._last_compression_status = "pending"
+        results = []
+        errors = []
+
+        def compress():
+            try:
+                results.append(
+                    engine.compress(
+                        messages,
+                        current_tokens=engine.threshold_tokens + 1,
+                    )
+                )
+            except BaseException as exc:  # pragma: no cover - red-path evidence
+                errors.append(exc)
+
+        foreground = Thread(target=compress, name=f"lcm-test-preflight-{iteration}")
+        foreground.start()
+        assert preflight_started.wait(2.0)
+
+        rebound = Event()
+
+        def rebind():
+            engine.on_session_start(
+                session_id,
+                conversation_id=conversation_id,
+                hermes_home=str(home_b),
+                context_length=1_000,
+            )
+            rebound.set()
+
+        rebind_thread = Thread(target=rebind, name=f"lcm-test-preflight-rebind-{iteration}")
+        rebind_thread.start()
+        try:
+            assert rebound.wait(2.0)
+            allow_preflight.set()
+            foreground.join(3.0)
+            rebind_thread.join(3.0)
+            assert not foreground.is_alive()
+            assert not rebind_thread.is_alive()
+            assert not errors
+            assert results == [messages]
+            assert not old_manager_used.is_set()
+            assert engine._dag.get_session_node_count(session_id) == 0
+        finally:
+            allow_preflight.set()
+            foreground.join(3.0)
+            rebind_thread.join(3.0)
+            engine.shutdown()
+
+
+def test_public_promotion_close_race_returns_non_promoted_without_assertion(
+    tmp_path, monkeypatch
+):
+    """Closing a manager cannot invalidate a public promotion snapshot."""
+    for iteration in range(200):
+        config = LCMConfig(
+            database_path=str(tmp_path / f"promote-close-{iteration}.db"),
+            async_background_compaction_enabled=True,
+        )
+        engine = LCMEngine(config=config)
+        manager = engine._async_compaction
+        assert manager is not None
+        capture_started = Event()
+        allow_capture = Event()
+        original_capture = manager.capture_snapshot
+
+        def blocked_capture(*args, **kwargs):
+            capture_started.set()
+            assert manager._operation_inflight == 1
+            assert allow_capture.wait(2.0)
+            return original_capture(*args, **kwargs)
+
+        monkeypatch.setattr(manager, "capture_snapshot", blocked_capture)
+        results = []
+        errors = []
+
+        def promote():
+            try:
+                results.append(manager.promote("missing-batch", []))
+            except BaseException as exc:  # pragma: no cover - red-path evidence
+                errors.append(exc)
+
+        promoter = Thread(target=promote, name=f"lcm-test-promote-{iteration}")
+        closer = Thread(target=manager.close, name=f"lcm-test-promote-close-{iteration}")
+        try:
+            promoter.start()
+            assert capture_started.wait(1.0)
+            closer.start()
+            closer.join(1.0)
+            assert not closer.is_alive()
+            allow_capture.set()
+            promoter.join(2.0)
+            assert not promoter.is_alive()
+            assert not errors
+            assert results and results[0].promoted is False
+        finally:
+            allow_capture.set()
+            promoter.join(2.0)
+            closer.join(2.0)
+            engine.shutdown()
+
+
+def test_status_and_tool_status_rebind_race_keeps_one_coherent_resource(
+    tmp_path, monkeypatch
+):
+    """Direct and tool status reads never cross a detached profile bundle."""
+    for iteration in range(200):
+        home_a = tmp_path / f"status-rebind-a-{iteration}"
+        home_b = tmp_path / f"status-rebind-b-{iteration}"
+        config = LCMConfig(database_path="", async_background_compaction_enabled=True)
+        engine = LCMEngine(config=config, hermes_home=str(home_a))
+        session_id = "status-rebind-session"
+        conversation_id = "status-rebind-conversation"
+        engine.on_session_start(
+            session_id,
+            conversation_id=conversation_id,
+            hermes_home=str(home_a),
+            context_length=1_000,
+        )
+        old_store = engine._store
+        assert old_store is not None
+        read_started = Event()
+        allow_read = Event()
+        errors = []
+        original_read = old_store.read_compaction_telemetry
+        original_count = old_store.get_session_count
+
+        def blocked_read(*args, **kwargs):
+            read_started.set()
+            assert allow_read.wait(2.0)
+            return original_read(*args, **kwargs)
+
+        def blocked_count(*args, **kwargs):
+            read_started.set()
+            assert allow_read.wait(2.0)
+            return original_count(*args, **kwargs)
+
+        monkeypatch.setattr(old_store, "read_compaction_telemetry", blocked_read)
+        monkeypatch.setattr(old_store, "get_session_count", blocked_count)
+        values = []
+        use_tool = iteration % 2 == 1
+
+        def read_status():
+            try:
+                values.append(
+                    json.loads(engine.handle_tool_call("lcm_status", {}))
+                    if use_tool
+                    else engine.get_status()
+                )
+            except BaseException as exc:  # pragma: no cover - red-path evidence
+                errors.append(exc)
+
+        status_thread = Thread(target=read_status, name=f"lcm-test-status-rebind-{iteration}")
+        status_thread.start()
+        assert read_started.wait(1.0)
+        rebind_thread = Thread(
+            target=lambda: engine.on_session_start(
+                session_id,
+                conversation_id=conversation_id,
+                hermes_home=str(home_b),
+                context_length=1_000,
+            ),
+            name=f"lcm-test-status-rebind-switch-{iteration}",
+        )
+        rebind_thread.start()
+        try:
+            allow_read.set()
+            status_thread.join(2.0)
+            rebind_thread.join(2.0)
+            assert not status_thread.is_alive()
+            assert not rebind_thread.is_alive()
+            assert not errors
+            assert values
+            if use_tool:
+                assert values[0].get("error") is None
+            else:
+                assert values[0].get("engine") == "lcm"
+        finally:
+            allow_read.set()
+            status_thread.join(2.0)
+            rebind_thread.join(2.0)
+            engine.shutdown()

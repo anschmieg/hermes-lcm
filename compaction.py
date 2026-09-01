@@ -598,7 +598,15 @@ class CompactionMixin:
                 )
                 async_manager = None
             if async_manager is not None:
+                if binding is not None and not self._foreground_binding_is_current(binding):
+                    self._last_compression_status = "noop"
+                    self._last_compression_noop_reason = "foreground compaction binding changed"
+                    return messages
                 async_source_map = self._get_store_id_map_for_messages(working_messages)
+                if binding is not None and not self._foreground_binding_is_current(binding):
+                    self._last_compression_status = "noop"
+                    self._last_compression_noop_reason = "foreground compaction binding changed"
+                    return messages
                 try:
                     async_result = async_manager.promote_next(messages)
                 except Exception:
@@ -608,8 +616,16 @@ class CompactionMixin:
                     )
                     async_result = None
                 if async_result is not None and async_result.promoted:
+                    if binding is not None and not self._foreground_binding_is_current(binding):
+                        self._last_compression_status = "noop"
+                        self._last_compression_noop_reason = "foreground compaction binding changed"
+                        return messages
                     async_batch = async_manager.get_batch(async_result.batch_id)
                     if async_batch is not None:
+                        if binding is not None and not self._foreground_binding_is_current(binding):
+                            self._last_compression_status = "noop"
+                            self._last_compression_noop_reason = "foreground compaction binding changed"
+                            return messages
                         async_source_ids = set(async_batch.source_ids)
                         working_messages = [
                             message for message in working_messages

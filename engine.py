@@ -16,6 +16,7 @@ import threading
 import time
 from collections import deque
 import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
@@ -104,6 +105,7 @@ class _ForegroundCompactionBinding:
     dag: Any
     lifecycle: Any
     manager: Any
+    manager_operation: Any = None
 from .query_view_store import QueryViewStore
 from .schemas import (
     LCM_DESCRIBE,
@@ -417,7 +419,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         # session rebinds and route updates take it while publishing new state.
         self._async_state_lock = threading.RLock()
         self._binding_generation = 0
-        self._foreground_operation_count = 0
+        self._resource_operation_count = 0
         self._retired_storage: list[tuple[Any, ...]] = []
         self._shutdown_started = False
         self._async_compaction: AsyncCompactionManager | None = None
@@ -800,7 +802,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 "_query_views",
             ):
                 setattr(self, attr, None)
-        if self._foreground_operation_count:
+        if self._resource_operation_count:
             self._retired_storage.append(bundle)
             manager = bundle[0]
             close = getattr(manager, "close", None)
@@ -832,55 +834,93 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 except Exception:
                     logger.debug("LCM failed closing %s during profile rebind", attr, exc_info=True)
 
+    def _capture_resource_binding(
+        self,
+        *,
+        create_manager: bool,
+    ) -> _ForegroundCompactionBinding | None:
+        """Capture storage and manager identities while the binding is locked."""
+        if self._shutdown_started or self._store is None:
+            return None
+        manager = self._async_compaction
+        if manager is None and create_manager:
+            manager = self._async_compaction_manager()
+        manager_operation = (
+            manager._acquire_operation() if manager is not None else None
+        )
+        if manager is not None and manager_operation is None:
+            return None
+        self._resource_operation_count += 1
+        return _ForegroundCompactionBinding(
+            generation=self._binding_generation,
+            session_id=str(self._session_id or ""),
+            conversation_id=str(self._conversation_id or ""),
+            hermes_home=str(self._hermes_home or ""),
+            config=copy.deepcopy(self._config),
+            store=self._store,
+            dag=self._dag,
+            lifecycle=self._lifecycle,
+            manager=manager,
+            manager_operation=manager_operation,
+        )
+
+    @contextmanager
+    def _resource_operation(self, *, hold_state_lock: bool = False):
+        """Retain one immutable storage/manager binding for a complete read."""
+        state_lock = self._async_state_lock
+        if hold_state_lock:
+            state_lock.acquire()
+        binding = None
+        try:
+            if hold_state_lock:
+                binding = self._capture_resource_binding(create_manager=False)
+            else:
+                with state_lock:
+                    binding = self._capture_resource_binding(create_manager=False)
+            yield binding
+        finally:
+            if binding is not None:
+                self._end_resource_binding(binding)
+            if hold_state_lock:
+                state_lock.release()
+
     def _begin_foreground_compaction(self) -> _ForegroundCompactionBinding | None:
         """Capture an immutable resource binding before any provider call."""
         with self._async_state_lock:
-            if self._shutdown_started or self._store is None:
-                return None
-            manager = self._async_compaction_manager()
-            if manager is None or not manager.begin_foreground_operation():
-                return None
-            self._foreground_operation_count += 1
-            return _ForegroundCompactionBinding(
-                generation=self._binding_generation,
-                session_id=str(self._session_id or ""),
-                conversation_id=str(self._conversation_id or ""),
-                hermes_home=str(self._hermes_home or ""),
-                config=copy.deepcopy(self._config),
-                store=self._store,
-                dag=self._dag,
-                lifecycle=self._lifecycle,
-                manager=manager,
-            )
+            return self._capture_resource_binding(create_manager=True)
 
     def _foreground_binding_is_current(self, binding: _ForegroundCompactionBinding) -> bool:
         with self._async_state_lock:
             return bool(
                 not self._shutdown_started
                 and self._binding_generation == binding.generation
+                and self._async_compaction is binding.manager
                 and self._store is binding.store
                 and self._dag is binding.dag
                 and self._lifecycle is binding.lifecycle
+                and self._hermes_home == binding.hermes_home
                 and self._session_id == binding.session_id
                 and self._conversation_id == binding.conversation_id
             )
 
     def _end_foreground_compaction(self, binding: _ForegroundCompactionBinding) -> None:
         """Release the binding and close detached generations after its last user."""
-        try:
-            binding.manager.end_foreground_operation()
-        finally:
-            with self._async_state_lock:
-                self._foreground_operation_count = max(
-                    0, self._foreground_operation_count - 1
-                )
-                if self._foreground_operation_count == 0 and self._retired_storage:
-                    retired = tuple(self._retired_storage)
-                    self._retired_storage.clear()
-                else:
-                    retired = ()
-            for bundle in retired:
-                self._close_storage_bundle(bundle)
+        self._end_resource_binding(binding)
+
+    def _end_resource_binding(self, binding: _ForegroundCompactionBinding) -> None:
+        if binding.manager_operation is not None:
+            binding.manager_operation.release()
+        with self._async_state_lock:
+            self._resource_operation_count = max(
+                0, self._resource_operation_count - 1
+            )
+            if self._resource_operation_count == 0 and self._retired_storage:
+                retired = tuple(self._retired_storage)
+                self._retired_storage.clear()
+            else:
+                retired = ()
+        for bundle in retired:
+            self._close_storage_bundle(bundle)
 
     def _assertion_extraction_model(self) -> str:
         return str(
@@ -1826,28 +1866,29 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         return manager.reject(batch_id, reason)
 
     def get_async_compaction_status(self) -> Dict[str, Any]:
-        manager = self._async_compaction
-        if manager is None:
-            return {
-                "enabled": bool(getattr(self._config, "async_background_compaction_enabled", False)),
-                "worker_enabled": bool(getattr(self._config, "async_background_compaction_worker_enabled", False)),
-                "pending_batches": 0,
-                "preparing_batches": 0,
-                "prepared_batches": 0,
-                "promoted_batches": 0,
-                "rejected_batches": 0,
-                "failed_batches": 0,
-                "superseded_batches": 0,
-                "queue_depth": 0,
-                "worker_active": False,
-                "enqueued_jobs": 0,
-                "dropped_jobs": 0,
-                "pending_summaries": 0,
-                "oldest_pending_age_seconds": None,
-                "last_rejected_reason": None,
-                "last_error": None,
-            }
-        return manager.status(self.current_conversation_id or self._conversation_id)
+        with self._resource_operation(hold_state_lock=True) as binding:
+            manager = binding.manager if binding is not None else None
+            if manager is None:
+                return {
+                    "enabled": bool(getattr(self._config, "async_background_compaction_enabled", False)),
+                    "worker_enabled": bool(getattr(self._config, "async_background_compaction_worker_enabled", False)),
+                    "pending_batches": 0,
+                    "preparing_batches": 0,
+                    "prepared_batches": 0,
+                    "promoted_batches": 0,
+                    "rejected_batches": 0,
+                    "failed_batches": 0,
+                    "superseded_batches": 0,
+                    "queue_depth": 0,
+                    "worker_active": False,
+                    "enqueued_jobs": 0,
+                    "dropped_jobs": 0,
+                    "pending_summaries": 0,
+                    "oldest_pending_age_seconds": None,
+                    "last_rejected_reason": None,
+                    "last_error": None,
+                }
+            return manager.status(binding.conversation_id)
 
     def drain_async_compaction(self, timeout: float | None = None) -> bool:
         manager = self._async_compaction
@@ -4124,6 +4165,20 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         return identity
 
     def get_status(self) -> Dict[str, Any]:
+        with self._resource_operation(hold_state_lock=True) as binding:
+            if binding is None:
+                return {
+                    "engine": "lcm",
+                    "status": "closed",
+                    "async_compaction": {
+                        "enabled": False,
+                        "pending_batches": 0,
+                        "prepared_batches": 0,
+                    },
+                }
+            return self._get_status_impl()
+
+    def _get_status_impl(self) -> Dict[str, Any]:
         status = super().get_status()
         status.update({
             "compression_count": self.compression_count,

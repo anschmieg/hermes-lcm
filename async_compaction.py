@@ -18,6 +18,7 @@ import sqlite3
 import threading
 import time
 import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Any, Callable, Dict, List, Mapping
@@ -41,6 +42,26 @@ logger = logging.getLogger(__name__)
 _PROTOCOL_VERSION = "async_compaction_protocol_v1"
 _ACTIVE_BATCH_STATES = ("pending", "preparing", "ready")
 _WORKER_CLOSE_TIMEOUT_SECONDS = 0.25
+
+
+class _ManagerOperation:
+    """Lease that keeps a manager connection usable until its caller returns."""
+
+    def __init__(self, manager: "AsyncCompactionManager"):
+        self._manager = manager
+        self._released = False
+
+    def release(self, *, completed_worker: bool = False) -> None:
+        if self._released:
+            return
+        self._released = True
+        self._manager._end_operation(completed_worker=completed_worker)
+
+    def __enter__(self) -> "_ManagerOperation":
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback) -> None:
+        self.release()
 
 
 @dataclass
@@ -94,6 +115,10 @@ class _BackgroundSnapshot:
     threshold_tokens: int = 0
     raw_context_length: int = 0
     binding_generation: int = 0
+    manager: Any = None
+    store: Any = None
+    dag: Any = None
+    lifecycle: Any = None
 
 
 @dataclass(frozen=True)
@@ -297,8 +322,7 @@ class AsyncCompactionManager:
         self._dropped_jobs = 0
         self._closed = False
         self._close_requested = False
-        self._foreground_inflight = 0
-        self._worker_inflight = 0
+        self._operation_inflight = 0
         self._foreground_claim = threading.local()
 
     @property
@@ -638,12 +662,53 @@ class AsyncCompactionManager:
                 if claim is None or token is None or int(claim[2]) == int(token):
                     self._foreground_claim.value = None
 
-    def begin_foreground_operation(self) -> bool:
+    def _begin_operation(self) -> bool:
         with self._lock:
             if self._closed or self._conn is None:
                 return False
-            self._foreground_inflight += 1
+            self._operation_inflight += 1
             return True
+
+    def _acquire_operation(self) -> _ManagerOperation | None:
+        if not self._begin_operation():
+            return None
+        return _ManagerOperation(self)
+
+    def _end_operation(self, *, completed_worker: bool = False) -> None:
+        with self._lock:
+            self._operation_inflight = max(0, self._operation_inflight - 1)
+            self._finish_close_locked(completed_worker=completed_worker)
+
+    @contextmanager
+    def _publication_lock(self):
+        """Acquire engine state before manager state for atomic publication."""
+        state_lock = getattr(self._engine, "_async_state_lock", None)
+        lock = state_lock if state_lock is not None else threading.Lock()
+        with lock:
+            with self._lock:
+                yield
+
+    def _snapshot_binding_is_current(self, snapshot: _BackgroundSnapshot) -> bool:
+        """Check the binding captured with a snapshot while state is fenced."""
+        return bool(
+            not self._closed
+            and not bool(getattr(self._engine, "_shutdown_started", False))
+            and int(getattr(self._engine, "_binding_generation", -1))
+            == snapshot.binding_generation
+            and snapshot.manager is self
+            and getattr(self._engine, "_async_compaction", None) is self
+            and getattr(self._engine, "_store", None) is snapshot.store
+            and getattr(self._engine, "_dag", None) is snapshot.dag
+            and getattr(self._engine, "_lifecycle", None) is snapshot.lifecycle
+            and str(getattr(self._engine, "_session_id", "") or "")
+            == snapshot.session_id
+            and str(getattr(self._engine, "_conversation_id", "") or "")
+            == snapshot.conversation_id
+        )
+
+    def begin_foreground_operation(self) -> bool:
+        """Compatibility wrapper over the shared manager operation lifetime."""
+        return self._begin_operation()
 
     def invalidate_foreground_claim(
         self,
@@ -666,23 +731,15 @@ class AsyncCompactionManager:
                 self._conn.rollback()
 
     def end_foreground_operation(self) -> None:
-        with self._lock:
-            self._foreground_inflight = max(0, self._foreground_inflight - 1)
-            self._finish_close_locked()
+        self._end_operation()
 
     def _begin_worker_operation(self) -> bool:
         """Reserve this manager before a worker callback can read SQLite."""
-        with self._lock:
-            if self._conn is None:
-                return False
-            self._worker_inflight += 1
-            return True
+        return self._begin_operation()
 
     def _end_worker_operation(self) -> None:
         """Release the worker's connection lease after its final SQLite read."""
-        with self._lock:
-            self._worker_inflight = max(0, self._worker_inflight - 1)
-            self._finish_close_locked(completed_worker=True)
+        self._end_operation(completed_worker=True)
 
     def publish_foreground_node(
         self,
@@ -850,11 +907,31 @@ class AsyncCompactionManager:
     def capture_snapshot(
         self,
         trigger: _BackgroundTrigger | None = None,
+        *,
+        _operation: _ManagerOperation | None = None,
+    ) -> _BackgroundSnapshot | None:
+        operation = _operation
+        owns_operation = operation is None
+        if operation is None:
+            operation = self._acquire_operation()
+            if operation is None:
+                return None
+        try:
+            return self._capture_snapshot(trigger)
+        finally:
+            if owns_operation:
+                operation.release()
+
+    def _capture_snapshot(
+        self,
+        trigger: _BackgroundTrigger | None = None,
     ) -> _BackgroundSnapshot | None:
         """Capture small immutable runtime state and a durable message upper bound."""
         state_lock = getattr(self._engine, "_async_state_lock", None)
         lock = state_lock if state_lock is not None else threading.Lock()
         with lock:
+            if self._closed or self._conn is None:
+                return None
             config = copy.deepcopy(self._engine._config)
             session_id = str(getattr(self._engine, "_session_id", "") or "")
             conversation_id = str(getattr(self._engine, "_conversation_id", "") or "")
@@ -873,6 +950,9 @@ class AsyncCompactionManager:
             threshold_tokens = int(getattr(self._engine, "threshold_tokens", 0) or 0)
             raw_context_length = int(getattr(self._engine, "raw_context_length", 0) or 0)
             binding_generation = int(getattr(self._engine, "_binding_generation", 0) or 0)
+            store = getattr(self._engine, "_store", None)
+            dag = getattr(self._engine, "_dag", None)
+            lifecycle = getattr(self._engine, "_lifecycle", None)
             with self._lock:
                 conn = self._conn
                 assert conn is not None
@@ -901,6 +981,10 @@ class AsyncCompactionManager:
             threshold_tokens=threshold_tokens,
             raw_context_length=raw_context_length,
             binding_generation=binding_generation,
+            manager=self,
+            store=store,
+            dag=dag,
+            lifecycle=lifecycle,
         )
 
     @classmethod
@@ -1547,22 +1631,22 @@ class AsyncCompactionManager:
         )
 
     def _run_trigger(self, trigger: _BackgroundTrigger) -> None:
-        if not self._begin_worker_operation():
+        operation = self._acquire_operation()
+        if operation is None:
             return
         try:
-            snapshot = self.capture_snapshot(trigger)
+            snapshot = self.capture_snapshot(trigger, _operation=operation)
             if snapshot is None:
                 return
             self._run_snapshot(snapshot)
         finally:
-            self._end_worker_operation()
+            operation.release(completed_worker=True)
 
     def _finish_close_locked(self, *, completed_worker: bool = False) -> None:
         """Close only after workers and foreground operations release the manager."""
         if (
             not self._close_requested
-            or self._foreground_inflight
-            or self._worker_inflight
+            or self._operation_inflight
         ):
             return
         worker = self._worker
@@ -1750,15 +1834,32 @@ class AsyncCompactionManager:
         batch_id: str,
         messages: List[Dict[str, Any]] | None = None,
     ) -> PromotionResult:
-        if self._closed:
-            return PromotionResult(False, "disabled", batch_id)
-        snapshot = self.capture_snapshot()
+        operation = self._acquire_operation()
+        if operation is None:
+            return PromotionResult(False, "closed", batch_id)
+        try:
+            snapshot = self.capture_snapshot(_operation=operation)
+            if snapshot is None:
+                return PromotionResult(False, "closed", batch_id)
+            return self._promote_with_snapshot(batch_id, messages, snapshot)
+        finally:
+            operation.release()
+
+    def _promote_with_snapshot(
+        self,
+        batch_id: str,
+        messages: List[Dict[str, Any]] | None = None,
+        snapshot: _BackgroundSnapshot | None = None,
+    ) -> PromotionResult:
+        if snapshot is None:
+            return PromotionResult(False, "closed", batch_id)
         if not bool(getattr(snapshot.config, "async_background_compaction_enabled", False)):
             return PromotionResult(False, "disabled", batch_id)
         maintenance_payload: _PromotionMaintenancePayload | None = None
-        with self._lock:
+        with self._publication_lock():
             conn = self._conn
-            assert conn is not None
+            if conn is None or not self._snapshot_binding_is_current(snapshot):
+                return PromotionResult(False, "stale_binding", batch_id)
             conn.execute("BEGIN IMMEDIATE")
             try:
                 batch = self._get_batch(batch_id)
@@ -2063,49 +2164,71 @@ class AsyncCompactionManager:
                 raise
 
     def promote_next(self, messages: List[Dict[str, Any]]) -> PromotionResult | None:
-        snapshot = self.capture_snapshot()
-        if not bool(getattr(snapshot.config, "async_background_compaction_enabled", False)):
-            return None
-        with self._lock:
-            conn = self._conn
-            assert conn is not None
-            session_id = snapshot.session_id
-            conversation_id = snapshot.conversation_id
-            row = conn.execute(
-                """
-                SELECT batch_id FROM compaction_batches
-                WHERE session_id = ? AND conversation_id = ? AND state = 'ready'
-                ORDER BY created_at LIMIT 1
-                """,
-                (session_id, conversation_id),
-            ).fetchone()
-        if row is None:
-            return None
-        return self.promote(str(row[0]), messages)
+        operation = self._acquire_operation()
+        if operation is None:
+            return PromotionResult(False, "closed", "")
+        try:
+            snapshot = self.capture_snapshot(_operation=operation)
+            if snapshot is None:
+                return PromotionResult(False, "closed", "")
+            if not bool(getattr(snapshot.config, "async_background_compaction_enabled", False)):
+                return None
+            with self._lock:
+                conn = self._conn
+                if self._closed or conn is None:
+                    return PromotionResult(False, "closed", "")
+                session_id = snapshot.session_id
+                conversation_id = snapshot.conversation_id
+                row = conn.execute(
+                    """
+                    SELECT batch_id FROM compaction_batches
+                    WHERE session_id = ? AND conversation_id = ? AND state = 'ready'
+                    ORDER BY created_at LIMIT 1
+                    """,
+                    (session_id, conversation_id),
+                ).fetchone()
+            if row is None:
+                return None
+            return self._promote_with_snapshot(str(row[0]), messages, snapshot)
+        finally:
+            operation.release()
 
     def status(self, conversation_id: str | None = None) -> Dict[str, Any]:
+        operation = self._acquire_operation()
+        if operation is None:
+            return self._closed_status()
+        try:
+            return self._status_with_operation(conversation_id)
+        finally:
+            operation.release()
+
+    @staticmethod
+    def _closed_status() -> Dict[str, Any]:
+        return {
+            "enabled": False,
+            "pending_batches": 0,
+            "prepared_batches": 0,
+            "promoted_batches": 0,
+            "rejected_batches": 0,
+            "failed_batches": 0,
+            "superseded_batches": 0,
+            "preparing_batches": 0,
+            "worker_enabled": False,
+            "queue_depth": 0,
+            "worker_active": False,
+            "enqueued_jobs": 0,
+            "dropped_jobs": 0,
+            "pending_summaries": 0,
+            "oldest_pending_age_seconds": None,
+            "last_rejected_reason": None,
+            "last_error": None,
+        }
+
+    def _status_with_operation(self, conversation_id: str | None = None) -> Dict[str, Any]:
         with self._lock:
             conn = self._conn
             if self._closed or conn is None or not self._background_tables_enabled:
-                return {
-                    "enabled": self._background_tables_enabled,
-                    "pending_batches": 0,
-                    "prepared_batches": 0,
-                    "promoted_batches": 0,
-                    "rejected_batches": 0,
-                    "failed_batches": 0,
-                    "superseded_batches": 0,
-                    "preparing_batches": 0,
-                    "worker_enabled": False,
-                    "queue_depth": 0,
-                    "worker_active": False,
-                    "enqueued_jobs": 0,
-                    "dropped_jobs": 0,
-                    "pending_summaries": 0,
-                    "oldest_pending_age_seconds": None,
-                    "last_rejected_reason": None,
-                    "last_error": None,
-                }
+                return self._closed_status()
             where = ""
             args: list[Any] = []
             if conversation_id:
@@ -2148,8 +2271,8 @@ class AsyncCompactionManager:
             worker = self._worker
             oldest_created_at = pending_rows[1] if pending_rows else None
             return {
-                "enabled": bool(getattr(self._engine._config, "async_background_compaction_enabled", False)),
-                "worker_enabled": bool(getattr(self._engine._config, "async_background_compaction_worker_enabled", False)),
+                "enabled": self._background_tables_enabled,
+                "worker_enabled": worker is not None,
                 "pending_batches": counts.get("pending", 0) + counts.get("preparing", 0),
                 "preparing_batches": counts.get("preparing", 0),
                 "prepared_batches": counts.get("ready", 0),
@@ -2192,5 +2315,9 @@ class AsyncCompactionManager:
             if not worker.close(timeout=_WORKER_CLOSE_TIMEOUT_SECONDS):
                 logger.warning("LCM async compaction worker did not stop before shutdown")
                 return
-        with self._lock:
+        if not self._lock.acquire(blocking=False):
+            return
+        try:
             self._finish_close_locked()
+        finally:
+            self._lock.release()
