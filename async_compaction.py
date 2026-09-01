@@ -174,8 +174,14 @@ def _freeze_maintenance_value(value: Any) -> Any:
 class _BoundedBackgroundWorker:
     """One daemon worker with non-blocking bounded enqueue and safe draining."""
 
-    def __init__(self, callback: Callable[[Any], None], max_items: int):
+    def __init__(
+        self,
+        callback: Callable[[Any], None],
+        max_items: int,
+        on_exit: Callable[[], None] | None = None,
+    ):
         self._callback = callback
+        self._on_exit = on_exit
         self._queue: queue.Queue[Any] = queue.Queue(maxsize=max(1, max_items))
         self._condition = threading.Condition()
         self._active = False
@@ -226,32 +232,39 @@ class _BoundedBackgroundWorker:
             self._condition.release()
 
     def _run(self) -> None:
-        while True:
-            with self._condition:
-                while self._queue.empty() and not self._stopping:
-                    self._condition.wait(0.1)
-                if self._stopping and self._queue.empty():
-                    return
-                # Reserve the next queue item before releasing the condition.
-                # A drain racing the actual dequeue now observes the worker as
-                # busy instead of mistaking the empty queue for idle.
-                self._active = True
-            try:
-                snapshot = self._queue.get_nowait()
-            except queue.Empty:
+        try:
+            while True:
                 with self._condition:
-                    self._active = False
-                    self._condition.notify_all()
-                continue
-            try:
-                self._callback(snapshot)
-            except Exception:
-                logger.warning("LCM async compaction worker job failed", exc_info=True)
-            finally:
-                self._queue.task_done()
-                with self._condition:
-                    self._active = False
-                    self._condition.notify_all()
+                    while self._queue.empty() and not self._stopping:
+                        self._condition.wait(0.1)
+                    if self._stopping and self._queue.empty():
+                        return
+                    # Reserve the next queue item before releasing the condition.
+                    # A drain racing the actual dequeue now observes the worker as
+                    # busy instead of mistaking the empty queue for idle.
+                    self._active = True
+                try:
+                    snapshot = self._queue.get_nowait()
+                except queue.Empty:
+                    with self._condition:
+                        self._active = False
+                        self._condition.notify_all()
+                    continue
+                try:
+                    self._callback(snapshot)
+                except Exception:
+                    logger.warning("LCM async compaction worker job failed", exc_info=True)
+                finally:
+                    self._queue.task_done()
+                    with self._condition:
+                        self._active = False
+                        self._condition.notify_all()
+        finally:
+            if self._on_exit is not None:
+                try:
+                    self._on_exit()
+                except Exception:
+                    logger.warning("LCM async compaction worker finalizer failed", exc_info=True)
 
     def drain(self, timeout: float | None = None) -> bool:
         deadline = None if timeout is None else time.monotonic() + max(0.0, timeout)
@@ -314,6 +327,7 @@ class AsyncCompactionManager:
                     1,
                     int(getattr(engine._config, "async_background_compaction_max_batches", 2) or 2),
                 ),
+                on_exit=self._finalize_worker_exit,
             )
             if worker_enabled and self._background_tables_enabled
             else None
@@ -1629,6 +1643,11 @@ class AsyncCompactionManager:
             str(getattr(self._engine, "_session_id", "") or ""),
             str(getattr(self._engine, "_conversation_id", "") or ""),
         )
+
+    def _finalize_worker_exit(self) -> None:
+        """Close deferred resources once this manager's worker has stopped."""
+        with self._lock:
+            self._finish_close_locked(completed_worker=True)
 
     def _run_trigger(self, trigger: _BackgroundTrigger) -> None:
         operation = self._acquire_operation()

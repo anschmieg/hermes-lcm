@@ -1512,6 +1512,82 @@ def test_manager_close_defers_connection_for_every_worker_stage(tmp_path, worker
         engine.shutdown()
 
 
+def test_rebind_closes_retired_manager_after_dequeue_handoff(tmp_path):
+    """A worker closed between dequeue and lease acquisition finalizes its manager."""
+    home_a = tmp_path / "dequeue-handoff-a"
+    home_b = tmp_path / "dequeue-handoff-b"
+    config = LCMConfig(
+        database_path="",
+        async_background_compaction_enabled=True,
+        async_background_compaction_worker_enabled=True,
+    )
+    engine = LCMEngine(config=config, hermes_home=str(home_a))
+    engine.on_session_start(
+        "dequeue-handoff-session",
+        conversation_id="dequeue-handoff-conversation",
+        hermes_home=str(home_a),
+        context_length=1_000,
+    )
+    old_manager = engine._async_compaction
+    assert old_manager is not None and old_manager._worker is not None
+    old_worker = old_manager._worker
+    old_connection = old_manager.connection
+    assert old_connection is not None
+    dequeued = Event()
+    allow_operation_acquisition = Event()
+
+    def controlled_get(*args, **kwargs):
+        item = Queue.get(old_worker._queue, *args, **kwargs)
+        dequeued.set()
+        assert allow_operation_acquisition.wait(3.0)
+        return item
+
+    old_worker._queue.get = controlled_get
+    old_worker._queue.get_nowait = controlled_get
+
+    rebind_returned = Event()
+    rebind_errors = []
+    rebind_thread = Thread(
+        target=lambda: (
+            engine.on_session_start(
+                "dequeue-handoff-rebound-session",
+                conversation_id="dequeue-handoff-rebound-conversation",
+                hermes_home=str(home_b),
+                context_length=1_000,
+            ),
+            rebind_returned.set(),
+        )
+    )
+    try:
+        assert old_worker.enqueue(
+            async_compaction_module._BackgroundTrigger(
+                "dequeue-handoff-session",
+                "dequeue-handoff-conversation",
+            )
+        )
+        assert dequeued.wait(2.0)
+
+        rebind_thread.start()
+        assert rebind_returned.wait(1.0)
+        assert not rebind_thread.is_alive()
+        assert Path(engine._store.db_path) == home_b / "lcm.db"
+        assert old_connection.execute("SELECT 1").fetchone()[0] == 1
+
+        allow_operation_acquisition.set()
+        old_worker._thread.join(3.0)
+        assert not old_worker._thread.is_alive()
+        assert old_manager.connection is None
+        with pytest.raises(sqlite3.ProgrammingError):
+            old_connection.execute("SELECT 1")
+    finally:
+        allow_operation_acquisition.set()
+        rebind_thread.join(3.0)
+        engine.shutdown()
+        if rebind_thread.is_alive():
+            rebind_errors.append("profile rebind thread did not exit")
+    assert not rebind_errors
+
+
 def test_foreground_publish_rejects_rewritten_source_inside_publish_fence(
     tmp_path, monkeypatch
 ):
