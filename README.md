@@ -9,7 +9,11 @@
 
 **Lossless Context Management plugin for [Hermes Agent](https://github.com/NousResearch/hermes-agent).**
 
-> Bounded context, unbounded memory. Nothing is ever lost.
+> Experimental release candidate: suitable for power users who keep backups and
+> want source-backed recall plus opt-in rolling compression. Do not treat this as
+> a compliance archive or a guarantee that foreground compression can never run.
+
+> Bounded context, recoverable history. Raw messages remain stored for bounded drill-down.
 
 `hermes-lcm` replaces one-shot active-context compression with a SQLite-backed,
 DAG-based context engine. It keeps the live prompt bounded, preserves raw
@@ -205,7 +209,7 @@ Typical output:
 
 ```text
 Plugins (1):
-  ✓ hermes-lcm v0.21.0-rc2 (15 tools)
+  ✓ hermes-lcm v0.21.0-rc3 (15 tools)
 
 Provider Plugins:
   Context Engine: lcm
@@ -244,7 +248,7 @@ If you installed a symlink from a separate checkout:
 
 Restart Hermes after updating.
 
-For the `v0.21.0-rc2` line, take a normal backup of `lcm.db` before updating,
+For the `v0.21.0-rc3` line, take a normal backup of `lcm.db` before updating,
 then update the checkout and restart Hermes. No manual core migration or
 backfill is required: the core schema remains version 5. New assertion,
 query-view, and adaptive-retrieval state is additive, created only after the
@@ -384,6 +388,10 @@ Most installs only need `plugins.enabled` and `context.engine: lcm`.
 | `LCM_DYNAMIC_LEAF_CHUNK_MAX` | `40000` | Upper bound for dynamic leaf chunk targets |
 | `LCM_THRESHOLD_FULL_SWEEP_ENABLED` | `false` | At threshold, opt into one synchronous bounded sweep that drains chunked raw history before publishing one new active context |
 | `LCM_SUMMARY_PREFIX_TARGET_TOKENS` | `0` | Sweep-only summary-frontier target; `0` derives one `LCM_LEAF_CHUNK_TOKENS` budget |
+| `LCM_ASYNC_BACKGROUND_COMPACTION_ENABLED` | `false` | Enable pending-summary preparation and atomic foreground publication |
+| `LCM_ASYNC_BACKGROUND_COMPACTION_WORKER_ENABLED` | `false` | Enqueue automatic preparation after completed turns |
+| `LCM_ASYNC_BACKGROUND_COMPACTION_MAX_BATCHES` | `2` | Bound queued and active background batches per conversation |
+| `LCM_ASYNC_BACKGROUND_COMPACTION_RETRY_BACKOFF_SECONDS` | `300` | Cooldown after a failed background summary batch |
 | `LCM_NEW_SESSION_RETAIN_DEPTH` | `2` | DAG depth retained after manual `/new` (`-1` all, `0` none) |
 | `LCM_DATABASE_PATH` | auto | SQLite database path. Empty config resolves to `HERMES_HOME/lcm.db`; plugin installs or operators may set this env var to another profile-scoped path such as `~/.hermes/hermes-lcm.db`. |
 | `LCM_FTS_INTEGRITY_CHECK_INTERVAL_HOURS` | `24` | Minimum hours between startup FTS5 deep integrity-checks (O(index size)). `0` checks every startup; a negative value never checks on startup. Structural checks always run regardless. |

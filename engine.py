@@ -16,6 +16,8 @@ import threading
 import time
 from collections import deque
 import uuid
+from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
@@ -88,6 +90,22 @@ from .rollup_builder import (
 from .assertion_extraction import ModelAssertionExtractor
 from .assertion_store import AssertionStore, SourceSnapshot
 from .adaptive_retrieval import AdaptiveRetrievalRegistry
+
+
+@dataclass(frozen=True)
+class _ForegroundCompactionBinding:
+    """Immutable resources and identity owned by one foreground operation."""
+
+    generation: int
+    session_id: str
+    conversation_id: str
+    hermes_home: str
+    config: Any
+    store: Any
+    dag: Any
+    lifecycle: Any
+    manager: Any
+    manager_operation: Any = None
 from .query_view_store import QueryViewStore
 from .schemas import (
     LCM_DESCRIBE,
@@ -126,6 +144,11 @@ from .aux_session import AuxiliarySessionMixin
 from .placeholder_ledger import PlaceholderLedgerMixin
 from .reconcile import ReconcileMixin, _PRESERVED_OBJECTIVE_CONTEXT_PREFIX
 from .compaction import CompactionMixin
+from .async_compaction import (
+    AsyncCompactionManager,
+    CompactionBatch,
+    PromotionResult,
+)
 from .reset_state import ResetStateMixin
 from .bypass import BypassMixin
 from .lifecycle_state import LifecycleStateStore
@@ -391,6 +414,16 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                  hermes_home: str = ""):
         self._config = config or LCMConfig.from_env()
         self._hermes_home = hermes_home
+        # The callback and session lifecycle can run on different host threads.
+        # Async snapshots take this lock while copying runtime identity/config;
+        # session rebinds and route updates take it while publishing new state.
+        self._async_state_lock = threading.RLock()
+        self._binding_generation = 0
+        self._resource_operation_count = 0
+        self._retired_storage: list[tuple[Any, ...]] = []
+        self._shutdown_started = False
+        self._async_compaction: AsyncCompactionManager | None = None
+        self._async_compaction_publish_failure_hook = ""
         self._assertion_extraction_metrics_lock = threading.RLock()
         self._assertion_extraction_idle = threading.Event()
         self._assertion_extraction_idle.set()
@@ -692,6 +725,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
 
     def _bind_storage(self, db_path: str | Path, hermes_home: str = "") -> None:
         """Bind store/DAG/lifecycle helpers to one SQLite database."""
+        self._async_compaction = None
         self._assertions = None
         self._query_views = None
         self._adaptive_retrieval = None
@@ -708,6 +742,10 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 # this engine can publish or delete a DAG node.
                 initialize_rollup_invalidation_outbox(self._dag)
             self._lifecycle = LifecycleStateStore(db_path)
+            # Background preparation remains opt-in. Disabled engines create
+            # the foreground fence lazily when a canonical write begins.
+            if bool(getattr(self._config, "async_background_compaction_enabled", False)):
+                self._async_compaction = AsyncCompactionManager(self)
             self._assertions = (
                 AssertionStore(db_path)
                 if bool(getattr(self._config, "assertions_enabled", False))
@@ -739,23 +777,150 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             self._close_storage()
             raise
 
-    def _close_storage(self) -> None:
-        """Best-effort close of currently bound SQLite helpers."""
-        for attr in (
+    def _close_storage(self, *, detach: bool = True) -> None:
+        """Retire current SQLite helpers, deferring close for foreground users."""
+        bundle = tuple(
+            getattr(self, attr, None)
+            for attr in (
+                "_async_compaction",
+                "_adaptive_retrieval",
+                "_store",
+                "_dag",
+                "_lifecycle",
+                "_assertions",
+                "_query_views",
+            )
+        )
+        if detach:
+            for attr in (
+                "_async_compaction",
+                "_adaptive_retrieval",
+                "_store",
+                "_dag",
+                "_lifecycle",
+                "_assertions",
+                "_query_views",
+            ):
+                setattr(self, attr, None)
+        if self._resource_operation_count:
+            self._retired_storage.append(bundle)
+            manager = bundle[0]
+            close = getattr(manager, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:
+                    logger.debug("LCM failed retiring async manager", exc_info=True)
+            return
+        self._close_storage_bundle(bundle)
+
+    @staticmethod
+    def _close_storage_bundle(bundle: tuple[Any, ...]) -> None:
+        """Best-effort close of one detached storage generation."""
+        attrs = (
+            "_async_compaction",
             "_adaptive_retrieval",
             "_store",
             "_dag",
             "_lifecycle",
             "_assertions",
             "_query_views",
-        ):
-            helper = getattr(self, attr, None)
+        )
+        for attr, helper in zip(attrs, bundle):
             close = getattr(helper, "close", None)
             if callable(close):
                 try:
                     close()
                 except Exception:
                     logger.debug("LCM failed closing %s during profile rebind", attr, exc_info=True)
+
+    def _capture_resource_binding(
+        self,
+        *,
+        create_manager: bool,
+    ) -> _ForegroundCompactionBinding | None:
+        """Capture storage and manager identities while the binding is locked."""
+        if self._shutdown_started or self._store is None:
+            return None
+        manager = self._async_compaction
+        if manager is None and create_manager:
+            manager = self._async_compaction_manager()
+        manager_operation = (
+            manager._acquire_operation() if manager is not None else None
+        )
+        if manager is not None and manager_operation is None:
+            return None
+        self._resource_operation_count += 1
+        return _ForegroundCompactionBinding(
+            generation=self._binding_generation,
+            session_id=str(self._session_id or ""),
+            conversation_id=str(self._conversation_id or ""),
+            hermes_home=str(self._hermes_home or ""),
+            config=copy.deepcopy(self._config),
+            store=self._store,
+            dag=self._dag,
+            lifecycle=self._lifecycle,
+            manager=manager,
+            manager_operation=manager_operation,
+        )
+
+    @contextmanager
+    def _resource_operation(self, *, hold_state_lock: bool = False):
+        """Retain one immutable storage/manager binding for a complete read."""
+        state_lock = self._async_state_lock
+        if hold_state_lock:
+            state_lock.acquire()
+        binding = None
+        try:
+            if hold_state_lock:
+                binding = self._capture_resource_binding(create_manager=False)
+            else:
+                with state_lock:
+                    binding = self._capture_resource_binding(create_manager=False)
+            yield binding
+        finally:
+            if binding is not None:
+                self._end_resource_binding(binding)
+            if hold_state_lock:
+                state_lock.release()
+
+    def _begin_foreground_compaction(self) -> _ForegroundCompactionBinding | None:
+        """Capture an immutable resource binding before any provider call."""
+        with self._async_state_lock:
+            return self._capture_resource_binding(create_manager=True)
+
+    def _foreground_binding_is_current(self, binding: _ForegroundCompactionBinding) -> bool:
+        with self._async_state_lock:
+            return bool(
+                not self._shutdown_started
+                and self._binding_generation == binding.generation
+                and self._async_compaction is binding.manager
+                and self._store is binding.store
+                and self._dag is binding.dag
+                and self._lifecycle is binding.lifecycle
+                and self._hermes_home == binding.hermes_home
+                and self._session_id == binding.session_id
+                and self._conversation_id == binding.conversation_id
+            )
+
+    def _end_foreground_compaction(self, binding: _ForegroundCompactionBinding) -> None:
+        """Release the binding and close detached generations after its last user."""
+        self._end_resource_binding(binding)
+
+    def _end_resource_binding(self, binding: _ForegroundCompactionBinding) -> None:
+        if binding.manager_operation is not None:
+            binding.manager_operation.release()
+        with self._async_state_lock:
+            self._resource_operation_count = max(
+                0, self._resource_operation_count - 1
+            )
+            if self._resource_operation_count == 0 and self._retired_storage:
+                retired = tuple(self._retired_storage)
+                self._retired_storage.clear()
+            else:
+                retired = ()
+        for bundle in retired:
+            self._close_storage_bundle(bundle)
 
     def _assertion_extraction_model(self) -> str:
         return str(
@@ -829,16 +994,18 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         """
         if not hermes_home:
             return False
+        requested_home = str(hermes_home)
         if self._config.database_path:
             current_home = str(self._hermes_home or "")
             current_store_home = str(getattr(getattr(self, "_store", None), "_hermes_home", "") or "")
-            if current_home == str(hermes_home) and current_store_home == str(hermes_home):
+            if current_home == requested_home and current_store_home == requested_home:
                 return False
-            self._hermes_home = hermes_home
-            store = getattr(self, "_store", None)
-            if store is not None:
-                store._hermes_home = hermes_home
+            self._binding_generation += 1
+            self._close_storage()
+            self._hermes_home = requested_home
+            self._bind_storage(self._resolve_db_path(requested_home), requested_home)
             self._reset_profile_runtime_state()
+            # _close_storage() already detached and deferred this generation.
             logger.info("LCM rebound Hermes home for configured database path %s", hermes_home)
             return True
 
@@ -847,6 +1014,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         if current_db == db_path and str(self._hermes_home or "") == str(hermes_home):
             return False
 
+        self._binding_generation += 1
         self._close_storage()
         self._hermes_home = hermes_home
         self._bind_storage(db_path, hermes_home)
@@ -1631,6 +1799,101 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             except Exception as e:
                 self._record_ingest_failure("per-turn ingest()", e)
 
+    def _async_compaction_manager(self) -> AsyncCompactionManager | None:
+        """Return the publication-fence manager; its worker stays opt-in."""
+        manager = self._async_compaction
+        if manager is None:
+            if self._shutdown_started or self._store is None:
+                return None
+            manager = AsyncCompactionManager(self)
+            self._async_compaction = manager
+        return manager
+
+    def on_turn_complete(
+        self,
+        messages: List[Dict[str, Any]],
+        usage: Dict[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> bool:
+        """Snapshot and enqueue background work without doing summary work.
+
+        ``usage`` and host metadata are accepted to match the ContextEngine
+        callback contract; preparation only needs the finalized transcript.
+
+        The normal post-turn hook has already called :meth:`ingest`, so this
+        seam only copies the host-owned history and performs a non-blocking
+        bounded enqueue. Hosts that call it directly must still use ``ingest``
+        when they need durable raw-message persistence.
+        """
+        # Do not materialize the manager or capture state here. Normal enabled
+        # engines create the manager during storage binding; this path only
+        # copies two short identity strings into the manager's bounded queue.
+        manager = self._async_compaction
+        if manager is None or not messages or self._session_ignored or self._session_stateless:
+            return False
+        return manager.enqueue_trigger(
+            str(self._session_id or ""),
+            str(self._conversation_id or ""),
+        )
+
+    def prepare_background_compaction_once(
+        self,
+        messages: List[Dict[str, Any]],
+        *,
+        leave_state: str | None = None,
+    ) -> CompactionBatch | None:
+        """Prepare one pending batch synchronously for tests and host adapters."""
+        manager = self._async_compaction_manager()
+        if manager is None:
+            return None
+        return manager.prepare(messages, leave_state=leave_state)
+
+    def promote_prepared_compaction(
+        self,
+        batch_id: str,
+        messages: List[Dict[str, Any]] | None = None,
+    ) -> PromotionResult:
+        """Attempt one validated, atomic pending-batch publication."""
+        manager = self._async_compaction_manager()
+        if manager is None:
+            return PromotionResult(False, "disabled", batch_id)
+        return manager.promote(batch_id, messages)
+
+    def reject_prepared_compaction(self, batch_id: str, *, reason: str) -> PromotionResult:
+        manager = self._async_compaction_manager()
+        if manager is None:
+            return PromotionResult(False, "disabled", batch_id)
+        return manager.reject(batch_id, reason)
+
+    def get_async_compaction_status(self) -> Dict[str, Any]:
+        with self._resource_operation(hold_state_lock=True) as binding:
+            manager = binding.manager if binding is not None else None
+            if manager is None:
+                return {
+                    "enabled": bool(getattr(self._config, "async_background_compaction_enabled", False)),
+                    "worker_enabled": bool(getattr(self._config, "async_background_compaction_worker_enabled", False)),
+                    "pending_batches": 0,
+                    "preparing_batches": 0,
+                    "prepared_batches": 0,
+                    "promoted_batches": 0,
+                    "rejected_batches": 0,
+                    "failed_batches": 0,
+                    "superseded_batches": 0,
+                    "queue_depth": 0,
+                    "worker_active": False,
+                    "enqueued_jobs": 0,
+                    "dropped_jobs": 0,
+                    "pending_summaries": 0,
+                    "oldest_pending_age_seconds": None,
+                    "last_rejected_reason": None,
+                    "last_error": None,
+                }
+            return manager.status(binding.conversation_id)
+
+    def drain_async_compaction(self, timeout: float | None = None) -> bool:
+        manager = self._async_compaction
+        return True if manager is None else manager.drain(timeout)
+
     def _is_retry_worthy_leaf_summary_error(self, exc: Exception) -> bool:
         if isinstance(exc, TimeoutError):
             return True
@@ -1653,11 +1916,14 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self,
         current_chunk: List[Dict[str, Any]],
         current_source_tokens: int,
+        *,
+        config: Any | None = None,
     ) -> List[Dict[str, Any]]:
         if len(current_chunk) <= 1:
             return []
 
-        floor_tokens = max(1, self._config.leaf_chunk_tokens)
+        active_config = config or self._config
+        floor_tokens = max(1, active_config.leaf_chunk_tokens)
         shrink_targets = [
             max(floor_tokens, int(current_source_tokens * 0.75)),
             max(floor_tokens, int(current_source_tokens * 0.50)),
@@ -1677,7 +1943,22 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         initial_chunk: List[Dict[str, Any]],
         focus_topic: Optional[str] = None,
         deadline: Optional[float] = None,
+        *,
+        _config_override: Any | None = None,
+        _session_id_override: str | None = None,
+        _hermes_home_override: str | None = None,
+        _circuit_breaker_override: Any | None = None,
+        _spend_guard_override: Any | None = None,
     ) -> tuple[List[Dict[str, Any]], int, str, int, int]:
+        active_config = _config_override or self._config
+        active_session_id = (
+            self._session_id if _session_id_override is None else _session_id_override
+        )
+        active_hermes_home = (
+            self._hermes_home if _hermes_home_override is None else _hermes_home_override
+        )
+        active_circuit_breaker = _circuit_breaker_override or self._summary_circuit_breaker
+        active_spend_guard = _spend_guard_override or self._summary_spend_guard
         attempt_chunk = list(initial_chunk)
         max_attempts = 3
         attempt_number = 0
@@ -1685,12 +1966,17 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         while attempt_chunk and attempt_number < max_attempts:
             attempt_number += 1
             source_tokens = count_messages_tokens(attempt_chunk)
-            serialized = self._serialize_messages(attempt_chunk)
+            serialized = self._serialize_messages(
+                attempt_chunk,
+                config=active_config,
+                session_id=active_session_id,
+                hermes_home=active_hermes_home,
+            )
             token_budget = max(2000, int(source_tokens * 0.20))
             token_budget = min(token_budget, 12000)
 
             try:
-                timeout_seconds = self._config.summary_timeout_ms / 1000
+                timeout_seconds = active_config.summary_timeout_ms / 1000
                 if deadline is not None:
                     remaining_seconds = deadline - time.monotonic()
                     if remaining_seconds <= 0:
@@ -1701,21 +1987,25 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                     source_tokens=source_tokens,
                     token_budget=token_budget,
                     depth=0,
-                    model=self._config.summary_model,
-                    fallback_models=self._config.summary_fallback_models,
-                    circuit_breaker=self._summary_circuit_breaker,
-                    spend_guard=self._summary_spend_guard,
+                    model=active_config.summary_model,
+                    fallback_models=active_config.summary_fallback_models,
+                    circuit_breaker=active_circuit_breaker,
+                    spend_guard=active_spend_guard,
                     timeout=timeout_seconds,
-                    l2_budget_ratio=self._config.l2_budget_ratio,
-                    l3_truncate_tokens=self._config.l3_truncate_tokens,
+                    l2_budget_ratio=active_config.l2_budget_ratio,
+                    l3_truncate_tokens=active_config.l3_truncate_tokens,
                     focus_topic=focus_topic or "",
-                    custom_instructions=self._config.custom_instructions,
+                    custom_instructions=active_config.custom_instructions,
                 )
                 return attempt_chunk, source_tokens, summary_text, level, attempt_number
             except Exception as exc:
                 if attempt_number >= max_attempts or not self._is_retry_worthy_leaf_summary_error(exc):
                     raise
-                smaller_chunk = self._next_leaf_rescue_chunk(attempt_chunk, source_tokens)
+                smaller_chunk = self._next_leaf_rescue_chunk(
+                    attempt_chunk,
+                    source_tokens,
+                    config=active_config,
+                )
                 if not smaller_chunk or len(smaller_chunk) >= len(attempt_chunk):
                     raise
                 logger.warning(
@@ -1855,7 +2145,14 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         ):
             self._schedule_rollup_maintenance(session_id)
 
-    def _invalidate_rollups_for_published_node(self, node: "SummaryNode") -> None:
+    def _invalidate_rollups_for_published_node(
+        self,
+        node: "SummaryNode",
+        *,
+        config: Any | None = None,
+        dag: Any | None = None,
+        session_id: str | None = None,
+    ) -> None:
         """Stale the rollups covering EVERY UTC day a just-published node spans.
 
         Rollups consume published summary nodes, so publication — not raw ingest
@@ -1866,11 +2163,13 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         crossing midnight stales BOTH days, not only its newest (maintainer #388
         blocker 2 / B2).
         """
-        if not self._config.temporal_rollups_enabled:
+        active_config = self._config if config is None else config
+        active_dag = self._dag if dag is None else dag
+        if not active_config.temporal_rollups_enabled or active_dag is None:
             return
         mark_stale_for_published_summary(
-            self._dag,
-            str(node.session_id or ""),
+            active_dag,
+            str(node.session_id if session_id is None else session_id or ""),
             node.latest_at,
             node.created_at,
             earliest_at=node.earliest_at,
@@ -2590,14 +2889,19 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self._log_session_filter_diagnostics()
 
     def on_session_start(self, session_id: str, **kwargs) -> None:
+        with self._async_state_lock:
+            self._on_session_start_unlocked(session_id, **kwargs)
+
+    def _on_session_start_unlocked(self, session_id: str, **kwargs) -> None:
+        previous_session_id = self._session_id
+        previous_conversation_id = self._conversation_id
+        requested_conversation_id = str(kwargs.get("conversation_id") or session_id)
         if "hermes_home" in kwargs:
             self._rebind_storage_for_home(str(kwargs.get("hermes_home") or ""))
 
         boundary_reason = str(kwargs.get("boundary_reason") or "")
         old_session_id = str(kwargs.get("old_session_id") or "")
-        previous_session_id = self._session_id
-        previous_conversation_id = self._conversation_id
-        requested_conversation_id = str(kwargs.get("conversation_id") or session_id)
+        self._binding_generation += 1
         self._lcm_current_start_allows_bypass_lineage = False
         requested_platform = str(kwargs.get("platform") or self._session_platform or "")
         pre_reset_preserve_ambiguous_no_frame_old_session = False
@@ -3614,6 +3918,8 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         store_ids: "list[int]",
         *,
         connection: "sqlite3.Connection | None" = None,
+        config: Any | None = None,
+        store: Any | None = None,
     ) -> None:
         """Soft-archive raw-history chunks for purged/GC'd messages (best effort).
 
@@ -3625,7 +3931,9 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         """
         if not store_ids:
             return
-        if not bool(getattr(self._config, "embeddings_enabled", False)):
+        active_config = self._config if config is None else config
+        active_store = self._store if store is None else store
+        if not bool(getattr(active_config, "embeddings_enabled", False)):
             return
         try:
             from .vector_store import VectorStore
@@ -3636,7 +3944,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                         connection, store_ids[offset:offset + 256]
                     )
                 return
-            store = VectorStore(self._store.db_path, config=self._config)
+            store = VectorStore(active_store.db_path, config=active_config)
             try:
                 store.archive_chunks_for_messages(store_ids)
             finally:
@@ -3857,6 +4165,20 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         return identity
 
     def get_status(self) -> Dict[str, Any]:
+        with self._resource_operation(hold_state_lock=True) as binding:
+            if binding is None:
+                return {
+                    "engine": "lcm",
+                    "status": "closed",
+                    "async_compaction": {
+                        "enabled": False,
+                        "pending_batches": 0,
+                        "prepared_batches": 0,
+                    },
+                }
+            return self._get_status_impl()
+
+    def _get_status_impl(self) -> Dict[str, Any]:
         status = super().get_status()
         status.update({
             "compression_count": self.compression_count,
@@ -3892,6 +4214,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             "config_sources": dict(getattr(self._config, "config_sources", {}) or {}),
             "config_source_warnings": list(getattr(self._config, "config_source_warnings", []) or []),
             "ignored_config_yaml_lcm_keys": list(getattr(self._config, "ignored_config_yaml_lcm_keys", []) or []),
+            "async_compaction": self.get_async_compaction_status(),
         })
         with self._assertion_extraction_metrics_lock:
             status["assertion_extraction"] = {
@@ -4039,20 +4362,21 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                      base_url: str = "", api_key: str = "",
                      provider: str = "",
                      api_mode: str = "") -> None:
-        parent_session_id = self._in_process_parent_session_id({})
-        if parent_session_id:
-            logger.debug(
-                "LCM model update ignored for auxiliary child of %s",
-                parent_session_id,
-            )
-            return
-        self.model = str(model or "")
-        self.base_url = str(base_url or "")
-        self.api_key = str(api_key or "")
-        self.provider = str(provider or "")
-        self.api_mode = str(api_mode or "")
-        self._set_context_length(context_length, source="update_model")
-        self._update_model_pending_session_start = True
+        with self._async_state_lock:
+            parent_session_id = self._in_process_parent_session_id({})
+            if parent_session_id:
+                logger.debug(
+                    "LCM model update ignored for auxiliary child of %s",
+                    parent_session_id,
+                )
+                return
+            self.model = str(model or "")
+            self.base_url = str(base_url or "")
+            self.api_key = str(api_key or "")
+            self.provider = str(provider or "")
+            self.api_mode = str(api_mode or "")
+            self._set_context_length(context_length, source="update_model")
+            self._update_model_pending_session_start = True
 
     def _refresh_session_filters(self) -> None:
         self._session_match_keys = build_session_match_keys(
@@ -5075,24 +5399,35 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self,
         compacted_chunk: List[Dict[str, Any]],
         source_store_ids: List[int],
+        *,
+        config: Any | None = None,
+        session_id: str | None = None,
+        hermes_home: str | None = None,
+        store: Any | None = None,
     ) -> None:
-        if not getattr(self._config, "large_output_transcript_gc_enabled", False):
+        active_config = self._config if config is None else config
+        active_session_id = self._session_id if session_id is None else session_id
+        active_hermes_home = self._hermes_home if hermes_home is None else hermes_home
+        active_store = self._store if store is None else store
+        if not getattr(active_config, "large_output_transcript_gc_enabled", False):
             return
         if not compacted_chunk or not source_store_ids:
             return
 
-        stored_by_id = self._store.get_batch(source_store_ids)
+        stored_by_id = active_store.get_batch(source_store_ids)
 
         def _archive_in_rewrite_txn(conn: "sqlite3.Connection", sid: int) -> None:
             # Runs inside gc_externalized_tool_result's write transaction, right
             # after the content rewrite and before its commit: archive this row's
             # now-stale chunks ATOMICALLY with the rewrite so a recall can never
             # slice the new (short) content at the old chunk offsets (F2).
-            self._archive_chunks_for_messages([sid], connection=conn)
+            self._archive_chunks_for_messages(
+                [sid], connection=conn, config=active_config, store=active_store
+            )
 
         for store_id in source_store_ids:
             stored = stored_by_id.get(store_id)
-            if not stored or stored.get("session_id") != self._session_id:
+            if not stored or stored.get("session_id") != active_session_id:
                 continue
             if stored.get("role") != "tool":
                 continue
@@ -5111,12 +5446,12 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             if ref:
                 externalized = load_externalized_payload(
                     ref,
-                    config=self._config,
-                    hermes_home=self._hermes_home,
+                    config=active_config,
+                    hermes_home=active_hermes_home,
                 )
                 if externalized is not None and externalized.get("kind", "tool_result") == "tool_result":
                     placeholder = build_transcript_gc_placeholder(externalized)
-                    self._store.gc_externalized_tool_result(
+                    active_store.gc_externalized_tool_result(
                         store_id, placeholder, before_commit=_archive_in_rewrite_txn
                     )
                     continue
@@ -5132,9 +5467,9 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 externalized = find_externalized_payload_for_message(
                     candidate,
                     tool_call_id=tool_call_id,
-                    session_id=self._session_id,
-                    config=self._config,
-                    hermes_home=self._hermes_home,
+                    session_id=active_session_id,
+                    config=active_config,
+                    hermes_home=active_hermes_home,
                 )
                 if externalized is not None:
                     break
@@ -5142,19 +5477,29 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 continue
 
             placeholder = build_transcript_gc_placeholder(externalized)
-            self._store.gc_externalized_tool_result(
+            active_store.gc_externalized_tool_result(
                 store_id, placeholder, before_commit=_archive_in_rewrite_txn
             )
 
-    def _serialize_messages(self, messages: List[Dict[str, Any]]) -> str:
+    def _serialize_messages(
+        self,
+        messages: List[Dict[str, Any]],
+        *,
+        config: Any | None = None,
+        session_id: str | None = None,
+        hermes_home: str | None = None,
+    ) -> str:
         """Serialize messages into labeled text for the summarizer."""
+        active_config = config or self._config
+        active_session_id = self._session_id if session_id is None else session_id
+        active_hermes_home = self._hermes_home if hermes_home is None else hermes_home
         parts = []
         matched_tool_ids = _matched_tool_call_ids(messages)
         for msg in messages:
             role = msg.get("role", "unknown")
             content = redact_sensitive_value(
                 msg.get("content") or "",
-                self._config,
+                active_config,
                 parse_json_strings=False,
             )
             if role == "tool":
@@ -5162,9 +5507,9 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 externalized = maybe_externalize_tool_output(
                     content,
                     tool_call_id=tool_id,
-                    session_id=self._session_id,
-                    config=self._config,
-                    hermes_home=self._hermes_home,
+                    session_id=active_session_id,
+                    config=active_config,
+                    hermes_home=active_hermes_home,
                 )
                 if externalized:
                     content = externalized["placeholder"]
@@ -5198,7 +5543,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                             args = fn.get("arguments", "")
                             args = redact_sensitive_value(
                                 args,
-                                self._config,
+                                active_config,
                                 parse_json_strings=True,
                             )
                             args = sanitize_pre_compaction_tool_arguments(args)
@@ -5557,7 +5902,14 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         """Check if any depth level has enough nodes for condensation."""
         self._last_condensation_suppressed_reason = ""
 
-        max_depth = self._config.incremental_max_depth
+        binding = getattr(self._thread_context, "foreground_binding", None)
+        active_config = binding.config if binding is not None else self._config
+        active_dag = binding.dag if binding is not None else self._dag
+        active_session_id = binding.session_id if binding is not None else self._session_id
+        if binding is not None and not self._foreground_binding_is_current(binding):
+            return
+
+        max_depth = active_config.incremental_max_depth
         if max_depth == 0:
             return  # condensation disabled
 
@@ -5565,19 +5917,19 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         # the deepest existing node + 1, so condensation can always
         # create the next depth level.
         if max_depth < 0:
-            all_nodes = self._dag.get_session_nodes(self._session_id)
+            all_nodes = active_dag.get_session_nodes(active_session_id)
             upper = (max(n.depth for n in all_nodes) + 1) if all_nodes else 1
         else:
             upper = max_depth
 
         condensed_any = False
         suppression_reason = ""
-        fanin = max(1, self._config.condensation_fanin)
+        fanin = max(1, active_config.condensation_fanin)
 
         for depth in range(upper):
-            uncondensed = self._dag.get_uncondensed_at_depth(
-                self._session_id, depth
-            )
+            if binding is not None and not self._foreground_binding_is_current(binding):
+                return
+            uncondensed = active_dag.get_uncondensed_at_depth(active_session_id, depth)
             if len(uncondensed) < fanin:
                 continue
 
@@ -5605,10 +5957,10 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 source_tokens, summary_tokens,
             )
 
-            if leaf_compacted_this_turn and self._config.cache_friendly_condensation_enabled:
+            if leaf_compacted_this_turn and active_config.cache_friendly_condensation_enabled:
                 break
 
-        if not condensed_any and leaf_compacted_this_turn and self._config.cache_friendly_condensation_enabled:
+        if not condensed_any and leaf_compacted_this_turn and active_config.cache_friendly_condensation_enabled:
             self._last_condensation_suppressed_reason = suppression_reason
 
     def _condense_summary_nodes(
@@ -5624,10 +5976,16 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         depth = nodes[0].depth
         if any(node.depth != depth for node in nodes):
             raise ValueError("condensation requires same-depth summary nodes")
+        binding = getattr(self._thread_context, "foreground_binding", None)
+        active_config = binding.config if binding is not None else self._config
+        active_dag = binding.dag if binding is not None else self._dag
+        active_session_id = binding.session_id if binding is not None else self._session_id
+        if binding is not None and not self._foreground_binding_is_current(binding):
+            return 0, 0, 0
         combined_text = "\n\n---\n\n".join(node.summary for node in nodes)
         source_tokens = sum(node.token_count for node in nodes)
         token_budget = max(1000, int(source_tokens * 0.40))
-        timeout_seconds = self._config.summary_timeout_ms / 1000
+        timeout_seconds = active_config.summary_timeout_ms / 1000
         if deadline is not None:
             remaining_seconds = deadline - time.monotonic()
             if remaining_seconds <= 0:
@@ -5638,22 +5996,24 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             source_tokens=source_tokens,
             token_budget=token_budget,
             depth=depth + 1,
-            model=self._config.summary_model,
-            fallback_models=self._config.summary_fallback_models,
+            model=active_config.summary_model,
+            fallback_models=active_config.summary_fallback_models,
             circuit_breaker=self._summary_circuit_breaker,
             spend_guard=self._summary_spend_guard,
             timeout=timeout_seconds,
-            l2_budget_ratio=self._config.l2_budget_ratio,
-            l3_truncate_tokens=self._config.l3_truncate_tokens,
+            l2_budget_ratio=active_config.l2_budget_ratio,
+            l3_truncate_tokens=active_config.l3_truncate_tokens,
             focus_topic=focus_topic or "",
-            custom_instructions=self._config.custom_instructions,
+            custom_instructions=active_config.custom_instructions,
         )
-        earliest_at, latest_at = self._dag.get_source_time_window(
+        if binding is not None and not self._foreground_binding_is_current(binding):
+            return 0, 0, 0
+        earliest_at, latest_at = active_dag.get_source_time_window(
             [node.node_id for node in nodes]
         )
         summary_tokens = count_tokens(summary_text)
         condensed_node = SummaryNode(
-            session_id=self._session_id,
+            session_id=active_session_id,
             depth=depth + 1,
             summary=summary_text,
             token_count=summary_tokens,
@@ -5665,8 +6025,25 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             latest_at=latest_at,
             expand_hint=self._extract_expand_hint(summary_text),
         )
-        self._dag.add_node(condensed_node)
-        self._invalidate_rollups_for_published_node(condensed_node)
+        if binding is not None and binding.conversation_id:
+            published = binding.manager.publish_foreground_node(
+                condensed_node,
+                conversation_id=binding.conversation_id,
+                session_id=binding.session_id,
+                claim_token=getattr(self._thread_context, "foreground_claim_token", None),
+                expected_generation=binding.generation,
+                config=binding.config,
+            )
+            if not published:
+                return 0, 0, 0
+        else:
+            self._dag.add_node(condensed_node)
+        self._invalidate_rollups_for_published_node(
+            condensed_node,
+            config=active_config if binding is not None else None,
+            dag=active_dag if binding is not None else None,
+            session_id=active_session_id if binding is not None else None,
+        )
         return source_tokens, summary_tokens, level
 
     def _summary_frontier_nodes(self) -> List[SummaryNode]:
@@ -6639,13 +7016,10 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
     # -- Lifecycle ---------------------------------------------------------
 
     def shutdown(self):
-        self._unregister_active_engine_binding()
-        if self._adaptive_retrieval is not None:
-            self._adaptive_retrieval.close()
-        self._store.close()
-        self._dag.close()
-        self._lifecycle.close()
-        if self._assertions is not None:
-            self._assertions.close()
-        if self._query_views is not None:
-            self._query_views.close()
+        with self._async_state_lock:
+            if self._shutdown_started:
+                return
+            self._shutdown_started = True
+            self._binding_generation += 1
+            self._unregister_active_engine_binding()
+            self._close_storage(detach=False)

@@ -597,6 +597,9 @@ def register(ctx):
                     conversation_id=conversation_id,
                 )
                 active_engine.ingest(history)
+                # Background preparation is queued by the native
+                # ContextEngine.on_turn_complete host seam. Calling it here as
+                # well would enqueue every completed turn twice.
             except Exception as exc:
                 logger.debug("LCM post_llm_call ingest error: %s", exc)
 

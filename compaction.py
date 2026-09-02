@@ -16,6 +16,7 @@ lifecycle) through normal attribute lookup. ``LCMEngine`` mixes this in ahead of
 from __future__ import annotations
 
 import logging
+import inspect
 import time
 from typing import Any, Dict, List, Optional
 
@@ -28,6 +29,23 @@ logger = logging.getLogger(__name__)
 
 _THRESHOLD_FULL_SWEEP_MAX_PASSES = 12
 _THRESHOLD_FULL_SWEEP_MAX_SECONDS = 120.0
+
+
+def _supported_leaf_summary_kwargs(summarizer: Any, kwargs: dict[str, Any]) -> dict[str, Any]:
+    """Keep legacy test/operator overrides compatible with the bound helper.
+
+    The production helper accepts private binding overrides so a foreground
+    operation can keep using its immutable session/config.  A host or test may
+    replace that helper with the historical three-argument callable, in which
+    case those private keywords must not change the public call shape.
+    """
+    try:
+        parameters = inspect.signature(summarizer).parameters
+    except (TypeError, ValueError):
+        return kwargs
+    if any(parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in parameters.values()):
+        return kwargs
+    return {key: value for key, value in kwargs.items() if key in parameters}
 
 
 class CompactionMixin:
@@ -352,22 +370,45 @@ class CompactionMixin:
                  focus_topic: Optional[str] = None,
                  force: bool = False) -> List[Dict[str, Any]]:
         """Run compaction and leave a terminal public status on every failure."""
+        begin_operation = getattr(self, "_begin_foreground_compaction", None)
+        binding = begin_operation() if callable(begin_operation) else None
+        if callable(begin_operation) and binding is None:
+            self._last_compression_status = "noop"
+            self._last_compression_noop_reason = "foreground compaction binding unavailable"
+            return messages
+        if binding is not None:
+            self._thread_context.foreground_binding = binding
         try:
             return self._compress_impl(
                 messages,
                 current_tokens=current_tokens,
                 focus_topic=focus_topic,
                 force=force,
+                _foreground_binding=binding,
             )
         except BaseException:
             self._last_compression_status = "error"
             self._last_compression_noop_reason = ""
             raise
+        finally:
+            claim_manager = getattr(self._thread_context, "foreground_claim_manager", None)
+            if claim_manager is not None:
+                try:
+                    claim_manager.release_foreground_claims(
+                        getattr(self._thread_context, "foreground_claim_token", None)
+                    )
+                finally:
+                    self._thread_context.foreground_claim_manager = None
+                    self._thread_context.foreground_claim_token = None
+            self._thread_context.foreground_binding = None
+            if binding is not None:
+                self._end_foreground_compaction(binding)
 
     def _compress_impl(self, messages: List[Dict[str, Any]],
                        current_tokens: int = None,
                        focus_topic: Optional[str] = None,
-                       force: bool = False) -> List[Dict[str, Any]]:
+                       force: bool = False,
+                       _foreground_binding: Any | None = None) -> List[Dict[str, Any]]:
         """Main compaction entry point.
 
         1. Ingest any new messages into the store
@@ -376,11 +417,17 @@ class CompactionMixin:
         4. Check if condensation is needed
         5. Assemble new active context: summaries + fresh tail
         """
+        binding = _foreground_binding
+        if binding is not None and not self._foreground_binding_is_current(binding):
+            self._last_compression_status = "noop"
+            self._last_compression_noop_reason = "foreground compaction binding changed"
+            return messages
         if not messages:
             self._last_compression_status = "noop"
             self._last_compression_noop_reason = "empty message list"
             return messages
 
+        preflight_requested = self._last_compression_status == "pending"
         self._last_compression_status = "running"
         self._last_compression_noop_reason = ""
         _compress_started = time.perf_counter()
@@ -426,7 +473,16 @@ class CompactionMixin:
         # Step 1: Ingest new messages into the immutable store. Work from a
         # replay-safe view so quarantined assistant loops do not enter summaries
         # or provider context after the durable row has been written.
-        working_messages = self._ingest_messages(messages)
+        if binding is not None:
+            state_lock = getattr(self, "_async_state_lock", None)
+            with state_lock:
+                if not self._foreground_binding_is_current(binding):
+                    self._last_compression_status = "noop"
+                    self._last_compression_noop_reason = "foreground compaction binding changed"
+                    return messages
+                working_messages = self._ingest_messages(messages)
+        else:
+            working_messages = self._ingest_messages(messages)
         ingest_cleanup_changed_active_context = working_messages != messages
         cleanup_only_due_to_boundary_cooldown = bool(
             self._preflight_cleanup_only_due_to_boundary_cooldown
@@ -518,6 +574,76 @@ class CompactionMixin:
             max_leaf_passes = _THRESHOLD_FULL_SWEEP_MAX_PASSES
         if deferred_maintenance_active:
             max_leaf_passes = max(1, self._config.deferred_maintenance_max_passes)
+
+        # Promotion is attempted only after the normal host preflight has
+        # requested compression. Direct calls to ``compress`` remain the
+        # synchronous compatibility path, which also gives a foreground call
+        # deterministic precedence over manually prepared test/operator work.
+        async_manager = binding.manager if binding is not None else None
+        if binding is not None and not binding.conversation_id:
+            # Legacy/unit callers may set only _session_id and bypass lifecycle
+            # binding.  Keep that historical in-process path; real foreground
+            # sessions always carry a conversation fence.
+            async_manager = None
+        if preflight_requested and not force_overflow:
+            try:
+                async_manager = async_manager or getattr(self, "_async_compaction_manager", lambda: None)()
+            except Exception:
+                # Async preparation is an optimization. A sidecar/opening or
+                # worker failure must leave the existing synchronous path
+                # available for the same turn.
+                logger.warning(
+                    "LCM async compaction setup failed; using foreground compaction",
+                    exc_info=True,
+                )
+                async_manager = None
+            if async_manager is not None:
+                if binding is not None and not self._foreground_binding_is_current(binding):
+                    self._last_compression_status = "noop"
+                    self._last_compression_noop_reason = "foreground compaction binding changed"
+                    return messages
+                async_source_map = self._get_store_id_map_for_messages(working_messages)
+                if binding is not None and not self._foreground_binding_is_current(binding):
+                    self._last_compression_status = "noop"
+                    self._last_compression_noop_reason = "foreground compaction binding changed"
+                    return messages
+                try:
+                    async_result = async_manager.promote_next(messages)
+                except Exception:
+                    logger.warning(
+                        "LCM async promotion failed; using foreground compaction",
+                        exc_info=True,
+                    )
+                    async_result = None
+                if async_result is not None and async_result.promoted:
+                    if binding is not None and not self._foreground_binding_is_current(binding):
+                        self._last_compression_status = "noop"
+                        self._last_compression_noop_reason = "foreground compaction binding changed"
+                        return messages
+                    async_batch = async_manager.get_batch(async_result.batch_id)
+                    if async_batch is not None:
+                        if binding is not None and not self._foreground_binding_is_current(binding):
+                            self._last_compression_status = "noop"
+                            self._last_compression_noop_reason = "foreground compaction binding changed"
+                            return messages
+                        async_source_ids = set(async_batch.source_ids)
+                        working_messages = [
+                            message for message in working_messages
+                            if async_source_map.get(id(message)) not in async_source_ids
+                        ]
+                        anchor_source_messages = list(working_messages)
+                        pressure_messages = list(working_messages)
+                        leaf_compacted_this_turn = True
+                        leaf_passes = async_batch.expected_leaf_count
+                        max_leaf_passes = 0
+
+        if async_manager is None and not (
+            binding is not None and not binding.conversation_id
+        ):
+            try:
+                async_manager = self._async_compaction_manager()
+            except Exception:
+                async_manager = None
 
         explicit_focus_topic = focus_topic is not None
 
@@ -697,9 +823,58 @@ class CompactionMixin:
                 break
 
             selected_raw_chunk = to_compact
+            if binding is not None and not self._foreground_binding_is_current(binding):
+                self._last_compression_status = "noop"
+                self._last_compression_noop_reason = "foreground compaction binding changed"
+                return messages
+            selected_source_map = self._get_store_id_map_for_messages(selected_raw_chunk)
             summary_input_chunk = [
                 message for message in selected_raw_chunk if id(message) not in dependent_reply_message_ids
             ]
+            source_ids = [
+                int(selected_source_map[id(message)])
+                for message in selected_raw_chunk
+                if id(message) in selected_source_map
+            ]
+            expected_source_identity_hashes_by_id: dict[int, str] = {}
+            if async_manager is not None and source_ids and summary_input_chunk:
+                if getattr(self._thread_context, "foreground_claim_manager", None) is None:
+                    if not async_manager.claim_foreground_sources(
+                        conversation_id=(
+                            binding.conversation_id if binding is not None else self._conversation_id
+                        ),
+                        session_id=(
+                            binding.session_id if binding is not None else self._session_id
+                        ),
+                        source_ids=source_ids,
+                        config=binding.config if binding is not None else self._config,
+                    ):
+                        self._last_compression_status = "noop"
+                        self._last_compression_noop_reason = "foreground compaction claim lost"
+                        noop_reason = "foreground compaction claim lost"
+                        break
+                    self._thread_context.foreground_claim_manager = async_manager
+                    self._thread_context.foreground_claim_token = (
+                        async_manager.foreground_claim_token()
+                    )
+                expected_source_identity_hashes_by_id = (
+                    async_manager.capture_foreground_source_identity_hashes(
+                        conversation_id=(
+                            binding.conversation_id if binding is not None else self._conversation_id
+                        ),
+                        session_id=(
+                            binding.session_id if binding is not None else self._session_id
+                        ),
+                        source_ids=source_ids,
+                    )
+                    or {}
+                )
+                if len(expected_source_identity_hashes_by_id) != len(
+                    set(source_ids)
+                ):
+                    self._last_compression_status = "noop"
+                    self._last_compression_noop_reason = "foreground source identity unavailable"
+                    return messages
             if not summary_input_chunk:
                 compacted_chunk = selected_raw_chunk
                 source_tokens = count_messages_tokens(selected_raw_chunk)
@@ -734,6 +909,16 @@ class CompactionMixin:
                     summary_kwargs: dict[str, Any] = {"focus_topic": focus_topic}
                     if threshold_full_sweep_active:
                         summary_kwargs["deadline"] = sweep_deadline
+                    summary_kwargs.update(
+                        _supported_leaf_summary_kwargs(
+                            self._summarize_leaf_chunk_with_rescue,
+                            {
+                                "_config_override": binding.config if binding is not None else None,
+                                "_session_id_override": binding.session_id if binding is not None else None,
+                                "_hermes_home_override": binding.hermes_home if binding is not None else None,
+                            },
+                        )
+                    )
                     (
                         compacted_chunk,
                         source_tokens,
@@ -773,15 +958,55 @@ class CompactionMixin:
             source_lineage_chunk = [
                 message for message in source_lookup_chunk if id(message) not in dependent_reply_message_ids
             ]
-            source_store_ids = self._get_store_ids_for_messages(source_lineage_chunk)
+            source_store_ids = [
+                int(selected_source_map[id(message)])
+                for message in source_lineage_chunk
+                if id(message) in selected_source_map
+            ]
             source_store_ids = sorted(dict.fromkeys(source_store_ids))
-            consumed_store_ids = self._get_store_ids_for_messages(source_lookup_chunk)
+            consumed_store_ids = [
+                int(selected_source_map[id(message)])
+                for message in source_lookup_chunk
+                if id(message) in selected_source_map
+            ]
             consumed_store_ids = sorted(dict.fromkeys(consumed_store_ids))
-            earliest_at, latest_at = self._store.get_time_bounds(source_store_ids)
+            if binding is not None and not source_store_ids:
+                # A carried active-context message can be eligible by position
+                # while having no durable message lineage in this session.  It
+                # must never become a canonical leaf with source_ids=[].
+                # Filter-only chunks still advance the in-process consumed
+                # marker; a provider result for an entirely unbacked chunk is
+                # deliberately discarded after the compatibility call above.
+                if consumed_store_ids:
+                    self._last_compacted_store_id = max(
+                        self._last_compacted_store_id,
+                        max(consumed_store_ids),
+                    )
+                if summary_input_chunk:
+                    self._last_compression_status = "noop"
+                    self._last_compression_noop_reason = "selected leaf chunk lacks raw store lineage"
+                    return messages
+                pressure_remaining_messages = pressure_messages[
+                    leading_anchor_count + selected_raw_len:
+                ]
+                working_messages = (
+                    working_messages[:leading_anchor_count] + remaining_messages
+                )
+                pressure_messages = (
+                    pressure_messages[:leading_anchor_count] + pressure_remaining_messages
+                )
+                dropped_replayed_scaffold_messages = True
+                continue
+            active_store = binding.store if binding is not None else self._store
+            if binding is not None and not self._foreground_binding_is_current(binding):
+                self._last_compression_status = "noop"
+                self._last_compression_noop_reason = "foreground compaction binding changed"
+                return messages
+            earliest_at, latest_at = active_store.get_time_bounds(source_store_ids)
             summary_tokens = count_tokens(summary_text)
 
             node = SummaryNode(
-                session_id=self._session_id,
+                session_id=binding.session_id if binding is not None else self._session_id,
                 depth=0,
                 summary=summary_text,
                 token_count=summary_tokens,
@@ -793,11 +1018,51 @@ class CompactionMixin:
                 latest_at=latest_at,
                 expand_hint=self._extract_expand_hint(summary_text),
             )
-            self._dag.add_node(node)
-            self._invalidate_rollups_for_published_node(node)
-            self._maybe_gc_compacted_tool_results(compacted_chunk, source_store_ids)
-            self._last_compacted_store_id = max(consumed_store_ids) if consumed_store_ids else 0
-            self._persist_frontier_marker()
+            published = True
+            if binding is not None and binding.conversation_id:
+                published = binding.manager.publish_foreground_node(
+                    node,
+                    conversation_id=binding.conversation_id,
+                    session_id=binding.session_id,
+                    claim_token=getattr(self._thread_context, "foreground_claim_token", None),
+                    frontier_store_id=max(consumed_store_ids) if consumed_store_ids else 0,
+                    expected_generation=binding.generation,
+                    config=binding.config,
+                    expected_source_identity_hashes=[
+                        expected_source_identity_hashes_by_id[source_id]
+                        for source_id in source_store_ids
+                    ],
+                )
+            else:
+                self._dag.add_node(node)
+            if not published:
+                self._last_compression_status = "noop"
+                self._last_compression_noop_reason = "foreground compaction claim lost"
+                return messages
+            self._invalidate_rollups_for_published_node(
+                node,
+                config=binding.config if binding is not None else None,
+                dag=binding.dag if binding is not None else None,
+                session_id=binding.session_id if binding is not None else None,
+            )
+            self._maybe_gc_compacted_tool_results(
+                compacted_chunk,
+                source_store_ids,
+                config=binding.config if binding is not None else None,
+                session_id=binding.session_id if binding is not None else None,
+                hermes_home=binding.hermes_home if binding is not None else None,
+                store=binding.store if binding is not None else None,
+            )
+            if binding is None:
+                self._last_compacted_store_id = max(consumed_store_ids) if consumed_store_ids else 0
+                self._persist_frontier_marker()
+            else:
+                with self._async_state_lock:
+                    if not self._foreground_binding_is_current(binding):
+                        return messages
+                    self._last_compacted_store_id = (
+                        max(consumed_store_ids) if consumed_store_ids else 0
+                    )
 
             pressure_remaining_messages = pressure_messages[leading_anchor_count + selected_raw_len:]
             working_messages = working_messages[:leading_anchor_count] + remaining_messages

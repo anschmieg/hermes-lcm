@@ -6398,6 +6398,17 @@ def lcm_status(args: Dict[str, Any], **kwargs) -> str:
     engine = _require_engine(kwargs)
     if engine is None:
         return json.dumps({"error": "LCM engine not initialized"})
+    with engine._resource_operation(hold_state_lock=True) as binding:
+        if binding is None:
+            return json.dumps({"error": "LCM engine is closed"})
+        return _lcm_status_impl(args, **kwargs)
+
+
+def _lcm_status_impl(args: Dict[str, Any], **kwargs) -> str:
+    """Quick health overview of the LCM engine for the current session."""
+    engine = _require_engine(kwargs)
+    if engine is None:
+        return json.dumps({"error": "LCM engine not initialized"})
 
     # Read the foreground view so a side-channel session that briefly owns
     # engine._session_id (cron tick inside the gateway process, debug probe,
@@ -6480,6 +6491,9 @@ def lcm_status(args: Dict[str, Any], **kwargs) -> str:
                 f"d{depth}": info for depth, info in sorted(depths.items())
             },
         },
+        "async_compaction": full_status.get(
+            "async_compaction", engine.get_async_compaction_status()
+        ),
         "config": {
             "fresh_tail_count": engine._config.fresh_tail_count,
             "fresh_tail_max_tokens": engine._config.fresh_tail_max_tokens,
@@ -6490,6 +6504,18 @@ def lcm_status(args: Dict[str, Any], **kwargs) -> str:
             "cache_friendly_min_debt_groups": engine._config.cache_friendly_min_debt_groups,
             "deferred_maintenance_enabled": engine._config.deferred_maintenance_enabled,
             "deferred_maintenance_max_passes": engine._config.deferred_maintenance_max_passes,
+            "async_background_compaction_enabled": bool(
+                getattr(engine._config, "async_background_compaction_enabled", False)
+            ),
+            "async_background_compaction_worker_enabled": bool(
+                getattr(engine._config, "async_background_compaction_worker_enabled", False)
+            ),
+            "async_background_compaction_max_batches": int(
+                getattr(engine._config, "async_background_compaction_max_batches", 2)
+            ),
+            "async_background_compaction_retry_backoff_seconds": float(
+                getattr(engine._config, "async_background_compaction_retry_backoff_seconds", 300.0)
+            ),
             "critical_budget_pressure_ratio": engine._config.critical_budget_pressure_ratio,
             "threshold_full_sweep_enabled": engine._config.threshold_full_sweep_enabled,
             "summary_prefix_target_tokens": engine._config.summary_prefix_target_tokens,
@@ -6627,6 +6653,24 @@ def lcm_doctor(args: Dict[str, Any], **kwargs) -> str:
             "check": "schema_core_tables",
             "status": "fail",
             "detail": str(e),
+        })
+
+    # Async compaction is opt-in and sidecar-only. A failed background batch is
+    # actionable backlog evidence, but never makes the synchronous compactor
+    # unusable; doctor reports it without attempting recovery or mutation.
+    try:
+        async_status = engine.get_async_compaction_status()
+        async_failed = int(async_status.get("failed_batches", 0) or 0)
+        checks.append({
+            "check": "async_compaction",
+            "status": "warn" if async_failed else "pass",
+            "detail": async_status,
+        })
+    except Exception as e:
+        checks.append({
+            "check": "async_compaction",
+            "status": "warn",
+            "detail": {"error": str(e), "read_only": True},
         })
 
     # 1b. FTS5 integrity, separated from generic SQLite integrity so malformed
