@@ -13,7 +13,6 @@ import copy
 import hashlib
 import json
 import logging
-import os
 import queue
 import sqlite3
 import threading
