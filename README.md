@@ -9,7 +9,11 @@
 
 **Lossless Context Management plugin for [Hermes Agent](https://github.com/NousResearch/hermes-agent).**
 
-> Bounded context, unbounded memory. Nothing is ever lost.
+> Experimental release candidate: suitable for power users who keep backups and
+> want source-backed recall plus opt-in rolling compression. Do not treat this as
+> a compliance archive or a guarantee that foreground compression can never run.
+
+> Bounded context, recoverable history. Raw messages remain stored for bounded drill-down.
 
 `hermes-lcm` replaces one-shot active-context compression with a SQLite-backed,
 DAG-based context engine. It keeps the live prompt bounded, preserves raw
@@ -205,7 +209,7 @@ Typical output:
 
 ```text
 Plugins (1):
-  ✓ hermes-lcm v0.21.0-rc2 (15 tools)
+  ✓ hermes-lcm v0.21.0-rc3 (15 tools)
 
 Provider Plugins:
   Context Engine: lcm
@@ -244,7 +248,7 @@ If you installed a symlink from a separate checkout:
 
 Restart Hermes after updating.
 
-For the `v0.21.0-rc2` line, take a normal backup of `lcm.db` before updating,
+For the `v0.21.0-rc3` line, take a normal backup of `lcm.db` before updating,
 then update the checkout and restart Hermes. No manual core migration or
 backfill is required: the core schema remains version 5. New assertion,
 query-view, and adaptive-retrieval state is additive, created only after the

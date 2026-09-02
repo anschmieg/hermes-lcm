@@ -6,6 +6,25 @@ This repo also publishes GitHub Releases. This file is the repo-root release sur
 
 No additional changes yet.
 
+## v0.21.0-rc3 - 2026-09-02
+
+### Highlights
+
+- Adds experimental async background compaction: LCM can prepare summary batches
+  after completed turns and atomically publish ready summaries at a later
+  foreground compaction boundary.
+- Keeps the default release posture conservative: async background compaction is
+  opt-in, existing storage remains recoverable, and stock installs keep optional
+  memory/retrieval feature families default-off.
+
+### Changed
+
+- Adds the `compaction_batches` / `pending_summary_nodes` preparation path, worker
+  controls, stale-batch recovery, and publication fences for ownership/profile
+  changes.
+- Documents async background compaction settings and the recommended cheap
+  `auxiliary.compression` model chain.
+
 ## v0.21.0-rc2 - 2026-08-05
 
 ### Changed
