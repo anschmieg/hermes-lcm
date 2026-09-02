@@ -13,6 +13,7 @@ import copy
 import hashlib
 import json
 import logging
+import os
 import queue
 import sqlite3
 import threading
@@ -20,6 +21,7 @@ import time
 import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass, field
+from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Callable, Dict, List, Mapping
 
@@ -36,6 +38,25 @@ from .escalation import SummaryCircuitBreaker, SummarySpendGuard
 from .dag import SummaryDAG, SummaryNode
 from .store import MessageStore
 from .tokens import count_message_tokens, count_messages_tokens, count_tokens
+
+_PLUGIN_VERSION: str | None = None
+
+def _read_plugin_version() -> str:
+    global _PLUGIN_VERSION
+    if _PLUGIN_VERSION is not None:
+        return _PLUGIN_VERSION
+    try:
+        manifest_path = Path(__file__).parent.parent / "plugin.yaml"
+        text = manifest_path.read_text(encoding="utf-8")
+        for line in text.splitlines():
+            if line.startswith("version:"):
+                _PLUGIN_VERSION = line.split(":", 1)[1].strip()
+                break
+        if _PLUGIN_VERSION is None:
+            _PLUGIN_VERSION = "unknown"
+    except Exception:
+        _PLUGIN_VERSION = "unknown"
+    return _PLUGIN_VERSION
 
 logger = logging.getLogger(__name__)
 
@@ -489,7 +510,7 @@ class AsyncCompactionManager:
                 getattr(snapshot, "api_mode", "") if snapshot is not None else getattr(self._engine, "api_mode", "")
             ) or "",
             "summary_timeout_ms": int(getattr(config, "summary_timeout_ms", 0) or 0),
-            "plugin_version": "hermes-lcm",
+            "plugin_version": _read_plugin_version(),
         }
         return self._hash_json(route)
 
