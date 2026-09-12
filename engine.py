@@ -2022,6 +2022,88 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
 
     # -- ContextEngine optional methods ------------------------------------
 
+    def select_context(
+        self,
+        request_messages: List[Dict[str, Any]],
+        *,
+        conversation_messages: List[Dict[str, Any]] = None,
+        incoming_message: Dict[str, Any] = None,
+        budget_tokens: int = 0,
+    ) -> Optional[List[Dict[str, Any]]]:
+        """Per-turn context selection: replace the request messages with the
+        LCM-assembled context (DAG summaries + fresh tail) when summaries exist.
+
+        This is the *selection* verb, distinct from compression:
+          - ``compress()``      : context is too long → shrink it.
+          - ``select_context()``: DAG has compacted history → use that instead.
+
+        When LCM has not yet compacted anything (no DAG summary nodes), the
+        raw ``request_messages`` are returned unchanged (``None``) so the host
+        skips the replacement and prompt-cache behaviour is unaffected.
+
+        The returned list is request-only — persisted conversation history is
+        never mutated.  The host runs this hook before cache-control and
+        request sanitizers, so whatever we return still passes through the
+        same validation as any request.
+        """
+        # Fast path: if we have no summary nodes, there is nothing to select.
+        # Return None (no-op) so the host leaves the request untouched and
+        # prompt-cache stays byte-identical.
+        all_nodes = self._dag.get_session_nodes(self._session_id)
+        if not all_nodes:
+            return None
+
+        # Extract system message (the leading anchor) from the request.
+        leading_anchor_count = self._leading_anchor_count(request_messages)
+        system_msg = request_messages[0] if leading_anchor_count else None
+        tail = request_messages[leading_anchor_count:]
+
+        # Determine the assembly cap from budget_tokens when available.
+        assembly_cap_override = None
+        if budget_tokens and budget_tokens > 0:
+            # Reserve 5% for completion tokens (matches the compressor's
+            # effective-window calculation in context_engine.py).
+            assembly_cap_override = int(budget_tokens * 0.95)
+
+        # Assemble the LCM-optimized context: DAG summaries + fresh tail.
+        assembled = self._assemble_context(
+            system_msg=system_msg,
+            tail_messages=tail,
+            assembly_cap_override=assembly_cap_override,
+            include_lcm_note=False,
+        )
+
+        # If assembly produced the same thing we already had (e.g. no
+        # summaries actually made it into the output), return None so the
+        # host doesn't replace a byte-identical list (preserving cache).
+        # A quick structural check: same length + same first content prefix.
+        if len(assembled) == len(request_messages):
+            # Check if the assembled context is structurally identical to
+            # the raw request — if so, skip replacement to preserve cache.
+            _identical = True
+            for i, (a, r) in enumerate(zip(assembled, request_messages)):
+                if a.get("role") != r.get("role"):
+                    _identical = False
+                    break
+                a_content = a.get("content", "")
+                r_content = r.get("content", "")
+                # Compare string content; list content (multi-part) → not identical
+                if isinstance(a_content, str) and isinstance(r_content, str):
+                    if a_content != r_content:
+                        _identical = False
+                        break
+                else:
+                    _identical = False
+                    break
+            if _identical:
+                return None
+
+        # Sanitize the result to ensure provider-valid message sequencing
+        # (role alternation, tool-call/result pairing, etc.)
+        assembled = self._sanitize_active_context_messages(assembled)
+
+        return assembled
+
     def _rollup_maintenance_key(self, scope: str) -> tuple[str, str]:
         raw_database_path = str(self._dag.db_path)
         if raw_database_path == ":memory:":
