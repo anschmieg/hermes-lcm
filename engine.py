@@ -1747,14 +1747,20 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
           - ``compress()``      : context is too long → shrink it.
           - ``select_context()``: DAG has compacted history → use that instead.
 
+        CACHE-AWARE DESIGN:
         When LCM has not yet compacted anything (no DAG summary nodes), the
         raw ``request_messages`` are returned unchanged (``None``) so the host
         skips the replacement and prompt-cache behaviour is unaffected.
 
-        The returned list is request-only — persisted conversation history is
-        never mutated.  The host runs this hook before cache-control and
-        request sanitizers, so whatever we return still passes through the
-        same validation as any request.
+        When summaries exist, the assembled context replaces old messages with
+        compact DAG summaries.  This ONLY breaks cache for messages that are
+        replaced — the system prompt, summary prefix, and fresh tail all stay
+        in their natural positions, preserving as much prefix cache as possible.
+
+        The assembled context is ONLY returned when it saves enough tokens to
+        justify the cache break (dynamic savings threshold based on context
+        pressure).  Tiny reductions that would destroy a large cached prefix
+        are skipped in favor of keeping the cache warm.
         """
         # Fast path: if we have no summary nodes, there is nothing to select.
         # Return None (no-op) so the host leaves the request untouched and
@@ -1786,10 +1792,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         # If assembly produced the same thing we already had (e.g. no
         # summaries actually made it into the output), return None so the
         # host doesn't replace a byte-identical list (preserving cache).
-        # A quick structural check: same length + same first content prefix.
         if len(assembled) == len(request_messages):
-            # Check if the assembled context is structurally identical to
-            # the raw request — if so, skip replacement to preserve cache.
             _identical = True
             for i, (a, r) in enumerate(zip(assembled, request_messages)):
                 if a.get("role") != r.get("role"):
@@ -1797,7 +1800,6 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                     break
                 a_content = a.get("content", "")
                 r_content = r.get("content", "")
-                # Compare string content; list content (multi-part) → not identical
                 if isinstance(a_content, str) and isinstance(r_content, str):
                     if a_content != r_content:
                         _identical = False
@@ -1808,9 +1810,53 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             if _identical:
                 return None
 
+        # CACHE-AWARE SAVINGS CHECK:
+        # Only return the assembled context if it saves enough tokens to
+        # justify breaking the prompt cache.  The savings threshold is
+        # calibrated so that:
+        #   - Small reductions (< 2K tokens) are NOT worth breaking cache
+        #   - Large reductions (> 8K tokens) are ALWAYS worth it
+        #   - Medium reductions: worth it when context is under pressure
+        #     (above 60% of budget) but not when there's plenty of room
+        assembled_tokens = count_messages_tokens(assembled)
+        request_tokens = count_messages_tokens(request_messages)
+        savings = request_tokens - assembled_tokens
+
+        # Dynamic threshold: higher when context is small (cache is more
+        # valuable relative to savings), lower when context is under pressure.
+        if budget_tokens > 0:
+            pressure = request_tokens / budget_tokens
+        else:
+            pressure = 0.0
+
+        # Minimum savings to justify a cache break:
+        #   - Low pressure (< 50%): need at least 8K or 6% of budget
+        #   - Medium pressure (50-75%): need at least 4K or 3% of budget
+        #   - High pressure (> 75%): need at least 2K tokens
+        if pressure < 0.5:
+            min_savings = max(8000, int((budget_tokens or 128000) * 0.06))
+        elif pressure < 0.75:
+            min_savings = max(4000, int((budget_tokens or 128000) * 0.03))
+        else:
+            min_savings = 2000
+
+        if savings < min_savings:
+            logger.debug(
+                "select_context: skipping replacement — savings (%d tokens) "
+                "below cache-break threshold (%d, pressure=%.0f%%)",
+                savings, min_savings, pressure * 100,
+            )
+            return None
+
         # Sanitize the result to ensure provider-valid message sequencing
         # (role alternation, tool-call/result pairing, etc.)
         assembled = self._sanitize_active_context_messages(assembled)
+
+        logger.info(
+            "select_context: replacing request — %d → %d tokens (saved %d, "
+            "pressure=%.0f%%, threshold=%d)",
+            request_tokens, assembled_tokens, savings, pressure * 100, min_savings,
+        )
 
         return assembled
 
